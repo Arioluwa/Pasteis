@@ -7,7 +7,6 @@ import rasterio
 from rasterio.windows import Window
 
 
-
 class SITSPatches:
   def __init__(self, sits_path, output_dir, patch_size=0, year=0):
     # self.__init__()
@@ -52,7 +51,8 @@ class SITSPatches:
                   dst.write(patch)
 
 
-    self.dataframe.to_csv(os.path.join(self.out_dir, f'patches_{self.year}.csv'), index=False)
+    self.dataframe.to_csv(os.path.join(out_year_dir, f'df_patches_{self.year}.csv'), index=False)
+
 
 project_dir = "/share/projects/erasmus/pasteis"
 for y in ['data/2018/2018_subset.tif', 'data/2019/2019_subset.tif']:
