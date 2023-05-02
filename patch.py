@@ -56,7 +56,7 @@ class SITSPatches:
 
 project_dir = "/share/projects/erasmus/pasteis"
 for y in ['data/2018/2018_subset.tif', 'data/2019/2019_subset.tif']:
-    patches_ = SITSPatches(sits_path=os.path.join(project_dir, y),output_dir = os.path.join(project_dir,"/prepData/patches"), patch_size = 32, year=str(y))
+    patches_ = SITSPatches(sits_path=os.path.join(project_dir, y),output_dir = os.path.join(project_dir,"/prepData/patches"), patch_size = 128, year=str(y))
     patches_.patch_sits()
 
 # if __name__ == "__main__" :
