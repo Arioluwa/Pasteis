@@ -14,76 +14,87 @@ import torchvision.transforms as transforms
 
 
 class Jittering(object):
-    def __init__(self, p):
+    def __init__(self, p, sigma):
         self.p = p
+        self.sigma = sigma
 
-    def __call__(self, img, sigma = 0.03):
-      img = img.numpy()
-      jitter = img + np.random.normal(loc=0., scale=sigma, size=img.shape)
-      return jitter
+    def __call__(self, sits):
+      # sits is a tuple of 2 time series
+      jittered = [img + np.random.normal(loc=0., scale=self.sigma, size=img.shape) for img in sits]
+      return tuple(jittered)
+      
 
 
 class Scaling(object):
-  def __init__(self, p):
-    self.p = p
+    def __init__(self, p, sigma):
+        self.p = p
+        self.sigma = sigma
 
-  def __call__(self, img, sigma = 0.1):
-    output_size = (img.shape[1],img.shape[2], img.shape[3]) 
-    factor = np.random.normal(loc=1., scale=sigma, size= output_size) 
-    return np.multiply(img, factor) 
+    def __call__(self, sits):
+        # sits is a tuple of 2 time series
+        scaled_ = tuple(np.multiply(img, np.random.normal(loc=1., scale=self.sigma, size=(img.shape[1],img.shape[2], img.shape[3])))
+                        for img in sits)
+        return scaled_ 
 
 
 class WindowSlice(object):
+    def __init__(self, p, magnitude):
+        self.p = p
+        self.magnitude = magnitude
 
-  def __init__(self, p):
-    self.p = p
+    def __call__(self, sits):
+        ts1, ts2 = sits
+        # Perform window slicing on both time series in the tuple
+        ts1_sliced = self._window_slice(ts1)
+        ts2_sliced = self._window_slice(ts2)
+        # Return the tuple of sliced time series
+        return ts1_sliced, ts2_sliced
+        #return tuple(ts1_sliced, ts2_sliced)
 
-  def __call__(self,img, magnitude= 0.1 ):
-    ts = img.copy()
+    def _window_slice(self, ts):
+        # ts is a 1D numpy array representing a time series
+        #ts = ts.copy()
+        if not self.magnitude or self.magnitude <= 0 or self.magnitude >= 1:
+          return ts
+        seq_len = ts.shape[0]
+        win_len = int(round(seq_len * (1 - self.magnitude)))
+        if win_len == seq_len:
+            return ts
+        start = np.random.randint(0, seq_len - win_len)
+        end = start + win_len
 
-    if not magnitude or magnitude <= 0 or magnitude >= 1:
+        x_old = np.linspace(0, 1, num=win_len)
+        x_new = np.linspace(0, 1, num=seq_len)
+        y_old = ts[start:end].numpy()
+        f = interp1d(x_old, y_old, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
+        ts_interpolated = torch.from_numpy(f(x_new)).clone().detach()
+        ts[start:end] = ts_interpolated[start:end]
         return ts
-    seq_len = ts.shape[0]
-    win_len = int(round(seq_len * (1 - magnitude)))
-    if win_len == seq_len:
-        return ts
-    start = np.random.randint(0, seq_len - win_len)
-    end = start + win_len
-
-    x_old = np.linspace(0, 1, num=win_len)
-    x_new = np.linspace(0, 1, num=seq_len)
-    y_old = ts[start:end] 
-    f = interp1d(x_old, y_old, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-    ts_interpolated = torch.from_numpy(f(x_new)).clone().detach()
-    ts[start:end] = ts_interpolated[start:end]
-
-    return ts
-
 
 
 ### a few helper functions ### 
 
 def date_list(path):
   with open(path, 'r') as f:
-      dates = f.readlines()
+    dates = f.readlines()
   dates = [d.strip() for d in dates]
   dates = [datetime.datetime.strptime(d, "%Y%m%d").strftime('%Y-%m-%d')  for d in dates]
   return dates
 
-
 def create_months_segment(dates):
-  segments = []
-  curr_month = dates[0].split('-')[1]
-  curr_segment = []
-  for i in range(len(dates)):
-    month = dates[i].split('-')[1]
-    if month != curr_month:
-      segments.append(curr_segment)
-      curr_month = month
-      curr_segment = []
-      curr_segment.append(i)
-  segments.append(curr_segment)
-
+    segments = []
+    curr_month = dates[0].split('-')[1]
+    curr_segment = [0]
+    for i in range(1, len(dates)):
+        month = dates[i].split('-')[1]
+        if month != curr_month:
+            segments.append(curr_segment)
+            curr_month = month
+            curr_segment = [i]
+        else:
+            curr_segment.append(i)
+    segments.append(curr_segment)
+    return segments
 
 def create_seasonal_segment(dates):
   segments = []
@@ -106,200 +117,216 @@ def create_seasonal_segment(dates):
         curr_segment = []
     curr_segment.append(i)
   segments.append(curr_segment)
+  return segments
 
 
 class WindowWarp(object):
-  def __init__(self, p, date_dir1, date_dir2):
+  def __init__(self, p, date_dir1, date_dir2,  timeframe = "", scale=[None, None]):
     self.p = p
     self.path18  = date_dir1
     self.path19  = date_dir2
+    self.timeframe = timeframe
+    self.scale = scale
+    self.scaling_factor = random.choice(self.scale)
 
-  def __call__(self, ts,  timeframe = "monthly", scale=[0.5, 2.0]):
-    assert isinstance(ts, tuple) and len(ts) == 2, "Input time series must be a tuple of two arrays"
-    assert isinstance(timeframe, str) and timeframe in ["monthly", "seasonal"], "Invalid timeframe"
-    assert isinstance(scale, list) and all(isinstance(x, float) and 0.0 <= x <= 5.0 for x in scale), "Invalid scaling factors"
+  def __call__(self, sits):
+    ts1, ts2 = sits
+    # Perform window slicing on both time series in the tuple
+    ts1_sliced = self.warp(ts1, self.path18 )
+    ts2_sliced = self.warp(ts2, self.path19)
+    # Return the tuple of sliced time series
+    return ts1_sliced, ts2_sliced
 
-    # load dates files for each time series
-    dates18 = date_list(self.path18)
-    dates19 = date_list(self.path19)
-
-    ts = np.copy(ts) # Create new time series for output
-    ts_18 , ts_19 = ts
+  def warp(self, ts, path):
+    dates = date_list(path)
+    ts = np.copy(ts) 
+    output_ts = np.zeros_like(ts)
+    if self.timeframe == "monthly":
+      segments = create_months_segment(dates) # segmented ts
       
-    output_ts_18 = np.zeros_like(ts_18)
-    output_ts_19 = np.zeros_like(ts_19)
-
-    scaling_factor = random.choice(scale)
-
-    if timeframe == "monthly":
-
-                          ########## first time series    #############
-
-      # Slice time series into segments based on months
-      segs_18 = create_months_segment(dates18) # segmented ts
-      seg_18 = random.choice(segs_18) # Choose a random segment and scaling factor
+      segment = random.choice(segments)
+      #print(segment)
 
       # index the window segments
-      strt_idx_18 = seg_18[0]  
-      end_idx_18 = seg_18[-1]
-      first_seg_18 = ts_18[:strt_idx_18,...]  # 1st part of the original time series 
-      last_segment_18 = ts_18[end_idx_18+1:,...]  # other part of the original time series 
+      strt_idx = segment[0]  
+      end_idx = segment[-1]
+      first_seg = ts[:strt_idx,...]  # 1st part of the original time series 
+      last_seg = ts[end_idx+1:,...]  # other part of the original time series 
       
       # create the segment window to warp
-      window_b4_warp_18 = ts_18[strt_idx_18:end_idx_18 + 1] #.to_numpy()
-      window_b4_warp_steps_18 = np.linspace(strt_idx_18, end_idx_18, end_idx_18 - strt_idx_18 + 1)
+      window_b4_warp= ts[strt_idx:end_idx + 1] #.to_numpy()
+      window_b4_warp_steps = np.linspace(strt_idx, end_idx, end_idx - strt_idx + 1)
       
       #
-      warped_window_len_18 = int(((end_idx_18 - strt_idx_18) + 1) * scaling_factor)
-      new_steps_18 = np.linspace(strt_idx_18, end_idx_18, warped_window_len_18)
+      warped_window_len = int(((end_idx - strt_idx) + 1) * self.scaling_factor)
+      new_steps = np.linspace(strt_idx, end_idx, warped_window_len)
      
-      interp_18= interp1d(window_b4_warp_steps_18, window_b4_warp_18, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      warped_segment_18 = interp_18(new_steps_18)
+      interp= interp1d(window_b4_warp_steps, window_b4_warp, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
+      warped_segment = interp(new_steps)
      
       # interpolate the warped window and replace to return to the original dimension
-      concat_segms_18 = np.concatenate((first_seg_18, warped_segment_18 , last_segment_18 ))
+      concat_segms = np.concatenate((first_seg, warped_segment , last_seg))
+      concat_steps = np.linspace(0, concat_segms.shape[0],concat_segms.shape[0] )
+      output_steps = np.linspace(0, ts.shape[0], ts.shape[0])
+
+      interp_ = interp1d(concat_steps, concat_segms, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
+      output = interp_(output_steps)
+      output_ts = output
+      return output_ts
+
+    if self.timeframe == "seasonal":
+      segments = create_seasonal_segment(dates) 
       
-
-      concat_steps_18 = np.linspace(0, concat_segms_18.shape[0],concat_segms_18.shape[0] )
-      output_steps_18 = np.linspace(0, ts_18.shape[0], ts_18.shape[0])
-
-      interp__18 = interp1d(concat_steps_18, concat_segms_18, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      output_18 = interp__18(output_steps_18)
-      output_ts_18 = output_18
-      
-
-                                      ########## second time series    #############
-
-      # Slice time series into segments based on months
-      segs_19 = create_months_segment(dates19)
-      seg_19 = random.choice(segs_19)
+      segment = random.choice(segments)
 
       # index the window segments
-      strt_idx_19 = seg_19[0]  
-      end_idx_19 = seg_19[-1]
-      first_seg_19 = ts_19[:strt_idx_19,...]  # 1st part of the original time series 
-      last_segment_19 = ts_19[end_idx_19 + 1:,...]  # other part of the original time series 
+      strt_idx = segment[0]  
+      end_idx = segment[-1]
+      first_seg = ts[:strt_idx,...]  # 1st part of the original time series 
+      last_seg = ts[end_idx+1:,...]  # other part of the original time series 
       
       # create the segment window to warp
-      window_b4_warp_19 = ts_19[strt_idx_19:end_idx_19 + 1] #.to_numpy()
-      window_b4_warp_steps_19 = np.linspace(strt_idx_19, end_idx_19, end_idx_19 - strt_idx_19 + 1)
+      window_b4_warp= ts[strt_idx:end_idx + 1] #.to_numpy()
+      window_b4_warp_steps = np.linspace(strt_idx, end_idx, end_idx - strt_idx + 1)
       
       #
-      warped_window_len_19 = int(((end_idx_19 - strt_idx_19) + 1) * scaling_factor)
-      new_steps_19 = np.linspace(strt_idx_19, end_idx_19, warped_window_len_19)
+      warped_window_len = int(((end_idx - strt_idx) + 1) * self.scaling_factor)
+      new_steps = np.linspace(strt_idx, end_idx, warped_window_len)
      
-      interp_19 = interp1d(window_b4_warp_steps_19, window_b4_warp_19, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      warped_segment_19 = interp_19(new_steps_19)
-     
-      # interpolate the warped window and replace to return to the original dimension
-      concat_segms_19 = np.concatenate((first_seg_19, warped_segment_19 , last_segment_19 ))
-      
-
-      concat_steps_19 = np.linspace(0, concat_segms_19.shape[0],concat_segms_19.shape[0] )
-      output_steps_19 = np.linspace(0, ts_19.shape[0], ts_19.shape[0])
-
-      interp__19 = interp1d(concat_steps_19, concat_segms_19, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      output_19 = interp__19(output_steps_19)
-      output_ts_19 = output_19
-
-      output = torch.cat([output_ts_18, output_ts_19 ])
-      return output
-
-
-    if timeframe == "seasonal":
-
-                                              ########## first time series    #############
-      segs_18 = create_seasonal_segment(dates18)
-      seg_18 = random.choice(segs_18) # Choose a random segment and scaling factor
-
-      # index the window segments
-      strt_idx_18 = seg_18[0]  
-      end_idx_18 = seg_18[-1]
-      first_seg_18 = ts_18[:strt_idx_18,...]  # 1st part of the original time series 
-      last_segment_18 = ts_18[end_idx_18+1:,...]  # other part of the original time series 
-      
-      # create the segment window to warp
-      window_b4_warp_18 = ts_18[strt_idx_18:end_idx_18 + 1] #.to_numpy()
-      window_b4_warp_steps_18 = np.linspace(strt_idx_18, end_idx_18, end_idx_18 - strt_idx_18 + 1)
-      
-      #
-      warped_window_len_18 = int(((end_idx_18 - strt_idx_18) + 1) * scaling_factor)
-      new_steps_18 = np.linspace(strt_idx_18, end_idx_18, warped_window_len_18)
-     
-      interp_18= interp1d(window_b4_warp_steps_18, window_b4_warp_18, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      warped_segment_18 = interp_18(new_steps_18)
+      interp= interp1d(window_b4_warp_steps, window_b4_warp, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
+      warped_segment = interp(new_steps)
      
       # interpolate the warped window and replace to return to the original dimension
-      concat_segms_18 = np.concatenate((first_seg_18, warped_segment_18 , last_segment_18 ))
-      
+      concat_segms = np.concatenate((first_seg, warped_segment , last_seg))
+      concat_steps = np.linspace(0, concat_segms.shape[0],concat_segms.shape[0] )
+      output_steps = np.linspace(0, ts.shape[0], ts.shape[0])
 
-      concat_steps_18 = np.linspace(0, concat_segms_18.shape[0],concat_segms_18.shape[0] )
-      output_steps_18 = np.linspace(0, ts_18.shape[0], ts_18.shape[0])
+      interp_ = interp1d(concat_steps, concat_segms, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
+      output = interp_(output_steps)
+      output_ts = output
+      return output_ts
 
-      interp__18 = interp1d(concat_steps_18, concat_segms_18, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      output_18 = interp__18(output_steps_18)
-      output_ts_18 = output_18
+class CutMix(object):
+    def __init__(self, p, date_dir1, date_dir2, timeframe="", alpha=0, beta=0):
+      self.p = p
+      self.path18 = date_dir1
+      self.path19 = date_dir2
+      self.timeframe = timeframe
+      self.alpha = alpha
+      self.beta = beta
+      self.mask = np.random.beta(self.alpha, self.beta)
+
+      self.dates18 = date_list(self.path18)
+      self.dates19 = date_list(self.path19)
+
+      self.segs18 = create_s(self.dates18)
+      self.segs19 = create_s(self.dates19)
+      self.same_month_segs18, self.same_month_segs19 = compare_segments(self.segs18, self.segs19)
+
+    def date_list(path):
+      with open(path, 'r') as f:
+        dates = f.readlines()
+      dates = [d.strip() for d in dates]
+      dates = [datetime.datetime.strptime(d, "%Y%m%d").strftime('%Y-%m-%d')  for d in dates]
+      return dates
+
+    def create_s(dates):
+      segments = []
+      curr_month = dates[0].split('-')[1]
+      curr_start = 0
+      for i in range(1, len(dates)):
+        month = dates[i].split('-')[1]
+        if month != curr_month:
+          curr_end = i - 1
+          if curr_end - curr_start >= 2:
+            segments.append((curr_start, curr_end, curr_month))
+            curr_month = month
+            curr_start = i
+      curr_end = len(dates) - 1
+      if curr_end - curr_start >= 2:
+        segments.append((curr_start, curr_end, curr_month))
+      return segments
+
+    def compare_segments(segs1, segs2):
+      same_month_segs1 = []
+      same_month_segs2 = []
+      for seg in segs1:
+        month = seg[2]
+        for other_seg in segs2:
+          if other_seg[2] == month:
+            same_month_segs1.append(seg)
+            same_month_segs2.append(other_seg)
+            break
+      return same_month_segs1, same_month_segs2
 
 
+    def rand_bbox(size, lam):
+      W = size[2]
+      H = size[3]
+      cut_rat = np.sqrt(1. - lam)
+      cut_w = np.int(W * cut_rat)
+      cut_h = np.int(H * cut_rat)
 
-       ########## second time series    #############
+      # uniform
+      cx = np.random.randint(W)
+      cy = np.random.randint(H)
 
-      # Slice time series into segments based on months
-      segs_19 = create_seasonal_segment(dates19)
-      seg_19 = random.choice(segs_19)
+      bbx1 = np.clip(cx - cut_w // 2, 0, W)
+      bby1 = np.clip(cy - cut_h // 2, 0, H)
+      bbx2 = np.clip(cx + cut_w // 2, 0, W)
+      bby2 = np.clip(cy + cut_h // 2, 0, H)
 
-      # index the window segments
-      strt_idx_19 = seg_19[0]  
-      end_idx_19 = seg_19[-1]
-      first_seg_19 = ts_19[:strt_idx_19,...]  # 1st part of the original time series 
-      last_segment_19 = ts_19[end_idx_19 + 1:,...]  # other part of the original time series 
-      
-      # create the segment window to warp
-      window_b4_warp_19 = ts_19[strt_idx_19:end_idx_19 + 1] #.to_numpy()
-      window_b4_warp_steps_19 = np.linspace(strt_idx_19, end_idx_19, end_idx_19 - strt_idx_19 + 1)
-      
-      #
-      warped_window_len_19 = int(((end_idx_19 - strt_idx_19) + 1) * scaling_factor)
-      new_steps_19 = np.linspace(strt_idx_19, end_idx_19, warped_window_len_19)
-     
-      interp_19 = interp1d(window_b4_warp_steps_19, window_b4_warp_19, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      warped_segment_19 = interp_19(new_steps_19)
-     
-      # interpolate the warped window and replace to return to the original dimension
-      concat_segms_19 = np.concatenate((first_seg_19, warped_segment_19 , last_segment_19 ))
-      
+      return bbx1, bby1, bbx2, bby2
 
-      concat_steps_19 = np.linspace(0, concat_segms_19.shape[0],concat_segms_19.shape[0] )
-      output_steps_19 = np.linspace(0, ts_19.shape[0], ts_19.shape[0])
+    def __call__(self, sits):
+      ts1, ts2 = sits
 
-      interp__19 = interp1d(concat_steps_19, concat_segms_19, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-      output_19 = interp__19(output_steps_19)
-      output_ts_19 = output_19
+      if np.random.rand() < self.p:
+        # Choose a random segment from the first time series
+        idx1 = np.random.randint(len(self.same_month_segs18))
+        start1, end1, month1 = self.same_month_segs18[idx1]
 
-      output = torch.cat([output_ts_18, output_ts_19 ])
-      return output
+          # Choose a random segment from the second time series of the same month
+        month2_segments = [(start2, end2) for start2, end2, month2 in self.same_month_segs19 if month2 == month1]
+        if len(month2_segments) > 0:
+          idx2 = np.random.randint(len(month2_segments))
+          start2, end2 = month2_segments[idx2]
 
+          # Ensure that both segments have the same length
+          seg_length = end1 - start1 + 1
+          if end2 - start2 + 1 >= seg_length:
+            # Apply the cutmix augmentation
+            lam = np.random.beta(self.alpha, self.beta)
+            lam = max(lam, 1 - lam)
+            bbx1, bby1, bbx2, bby2 = rand_bbox(ts1.shape, lam)
+            ts1[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * self.mask + ts1[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask)
+            ts2[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask) + ts1[:, :, bbx1:bbx2, bby1:bby2] * self.mask
 
+      return ts1, ts2
 
 class TrainTransform(object):
   def __init__(self):
     self.transform = transforms.Compose([
-        Jittering(p= 1.0),
-        Scaling(p = 1.0),
-        WindowSlice(p=0.8),
-        WindowWarp(p=0.8, date_dir1= d_path18, date_dir2= d_path19)
+        Jittering(p= 1.0, sigma = 0.03),
+        Scaling(p = 1.0, sigma = 0.1),
+        WindowSlice(p=0.8,  magnitude= 0.1),
+        WindowWarp(p=0.5, date_dir1= d_path18, date_dir2= d_path19, timeframe = "monthly", scale=[0.5, 2.0]),
+        CutMix(p=0.5, date_dir1 = d_path18, date_dir2 = d_path19, timeframe="monthly", alpha=1.0, beta=1.0),
+
     ])
     self.transform_prime = transforms.Compose([
-        Jittering(p= 0.1),
-        Scaling(p = 1.0),
-        WindowSlice(p=0.2),
-        WindowWarp(p=0.2, date_dir1= d_path18, date_dir2= d_path19)
-        
+        Jittering(p= 0.1, sigma = 0.03),
+        Scaling(p = 1.0, sigma = 1.0),
+        WindowSlice(p=0.2,  magnitude= 0.1),
+        WindowWarp(p=0.5, date_dir1= d_path18, date_dir2= d_path19, timeframe = "monthly", scale=[0.5, 2.0]),
+        CutMix(p=0.5, date_dir1 = d_path18, date_dir2 = d_path19, timeframe="monthly", alpha=1.0, beta=1.0),
     ])
 
-  def __call__(self, sample):
-    sits_18, sits_19 = sample[0], sample[1]
-    sits_combined = torch.cat([sits_18, sits_19], dim=1)
-    x1 = self.transform(sample)
-    x2 = self.transform_prime(sample)
-    return x1, x2
+  def __call__(self,sample):
+    
+    x = self.transform(sample)
+    x_prime = self.transform(sample)
+
+    return x, x_prime
+
+augmentations = TrainTransform()
