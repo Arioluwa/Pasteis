@@ -5,8 +5,10 @@ import numpy as np
 import pandas as pd
 import random
 import rasterio as rio
+import calendar
 from scipy.interpolate import interp1d
 import datetime
+from datetime import timedelta
 import torch.utils.data 
 from torch.utils.data import Dataset, DataLoader, random_split
 from itertools import islice
@@ -206,6 +208,95 @@ class WindowWarp(object):
       output_ts = output
       return output_ts
 
+class Resample(object):
+  def __init__(self, p, date_dir1, date_dir2):
+    self.p = p
+    self.path18 = date_dir1
+    self.path19 = date_dir2
+    self.samedates = self.common_dates(self.path18, self.path19)
+    self.dates18 = date_list(self.path18)
+    self.dates19 = date_list(self.path19)
+
+  def __call__(self, sits):
+    ts1, ts2 = sits
+    resampled1, _ = self.resample(ts1, self.path18, self.samedates,  year=2018)
+    resampled2 , _ = self.resample(ts1, self.path19, self.samedates, year=2019)
+
+    return resampled1, resampled2
+
+  def date_list(self, path):
+    with open(path, 'r') as f:
+     dates = f.readlines()
+    dates = [d.strip() for d in dates]
+    dates = [datetime.datetime.strptime(d, "%Y%m%d").strftime('%Y-%m-%d')  for d in dates]
+    return dates
+
+  def common_dates(self, path1, path2):
+    dates1 = path1
+    dates2 = path2
+    with open(path1, 'r') as d1, open(path2, 'r') as d2:
+      list1 = [datetime.datetime.strptime(d.strip(), "%Y%m%d").timetuple().tm_yday for d in d1.readlines()]
+      list2 = [datetime.datetime.strptime(d.strip(), "%Y%m%d").timetuple().tm_yday for d in d2.readlines()]
+
+    common_dates = list(set(list1) & set(list2))
+    common_dates.sort()
+
+    return common_dates
+
+  
+  def get_date_from_yday(self, yday, year):
+      date = datetime(year, 1, 1) + timedelta(yday - 1)
+      return date.strftime("%Y-%m-%d")
+
+  def resample(self, img, date_path, samedates, year=None):
+    # get the original dates of the sits
+  
+    acquisition_dates = self.date_list(date_path)
+    # Create list of all dates in 2018
+    year_dates = []
+    for month in range(1, 13):
+        num_days = calendar.monthrange(year, month)[1]
+        for day in range(1, num_days+1):
+            date_str = f'year-{month:02d}-{day:02d}'
+            year_dates.append(date_str)
+
+    # Create new array to hold upsampled data
+    upsampled_data = np.zeros((365, 10, 64, 64))
+    interpolated_dates = []
+    upsampled_dates = []
+    #upsample data
+    for i, date in enumerate(year_dates):
+      if date in acquisition_dates:
+        # Copy corresponding image data to new array
+        index = acquisition_dates.index(date)
+        upsampled_data[i] = img[index]
+      else:
+        interpolated_dates.append(date)
+        # Perform interpolation to generate new image
+        f = interp1d(np.arange(img.shape[0]), img, axis=0, kind='linear')
+        upsampled_data[i] = f(i % img.shape[0])
+    upsampled_dates = acquisition_dates + interpolated_dates
+    upsampled_dates.sort()
+
+    no_change_dates = [self.get_date_from_yday(yday, year) for yday in self.same_dates]
+    downsampled_data = np.zeros((img.shape))
+    downsampled_dates = []
+    for i, dt in enumerate(upsampled_dates):
+      if dt in no_change_dates:
+        idx = no_change_dates.index(dt)
+        downsampled_data[idx] = upsampled_data[i]
+        downsampled_dates.append(dt)
+       
+    random_indices = random.sample(range(0, 366), 20)
+    for i, index in enumerate(random_indices):
+        if upsampled_dates[index] not in no_change_dates:
+            downsampled_data[i + len(no_change_dates)] = upsampled_data[index]
+        downsampled_dates.append(upsampled_dates[index])
+        downsampled_dates.sort()
+
+    return downsampled_data, downsampled_dates
+
+
 class CutMix(object):
     def __init__(self, p, date_dir1, date_dir2, timeframe="", alpha=0, beta=0):
       self.p = p
@@ -218,19 +309,42 @@ class CutMix(object):
 
       self.dates18 = date_list(self.path18)
       self.dates19 = date_list(self.path19)
-
       self.segs18 = create_s(self.dates18)
       self.segs19 = create_s(self.dates19)
       self.same_month_segs18, self.same_month_segs19 = compare_segments(self.segs18, self.segs19)
 
-    def date_list(path):
+    def __call__(self, sits):
+      ts1, ts2 = sits
+      # Choose a random segment from the first time series
+      idx1 = np.random.randint(len(self.same_month_segs18))
+      start1, end1, month1 = self.same_month_segs18[idx1]
+
+      # Choose a random segment from the second time series of the same month
+      month2_segments = [(start2, end2) for start2, end2, month2 in self.same_month_segs19 if month2 == month1]
+      if len(month2_segments) > 0:
+        idx2 = np.random.randint(len(month2_segments))
+        start2, end2 = month2_segments[idx2]
+
+        # Ensure that both segments have the same length
+        seg_length = end1 - start1 + 1
+        if end2 - start2 + 1 >= seg_length:
+          # Apply the cutmix augmentation
+          lam = np.random.beta(self.alpha, self.beta)
+          lam = max(lam, 1 - lam)
+          bbx1, bby1, bbx2, bby2 = rand_bbox(ts1.shape, lam)
+          ts1[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * self.mask + ts1[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask)
+          ts2[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask) + ts1[:, :, bbx1:bbx2, bby1:bby2] * self.mask
+
+      return ts1, ts2
+
+    def date_list(self, path):
       with open(path, 'r') as f:
         dates = f.readlines()
       dates = [d.strip() for d in dates]
       dates = [datetime.datetime.strptime(d, "%Y%m%d").strftime('%Y-%m-%d')  for d in dates]
       return dates
 
-    def create_s(dates):
+    def create_s(self, dates):
       segments = []
       curr_month = dates[0].split('-')[1]
       curr_start = 0
@@ -247,7 +361,7 @@ class CutMix(object):
         segments.append((curr_start, curr_end, curr_month))
       return segments
 
-    def compare_segments(segs1, segs2):
+    def compare_segments(self, segs1, segs2):
       same_month_segs1 = []
       same_month_segs2 = []
       for seg in segs1:
@@ -260,12 +374,12 @@ class CutMix(object):
       return same_month_segs1, same_month_segs2
 
 
-    def rand_bbox(size, lam):
+    def rand_bbox(self, size, lam):
       W = size[2]
       H = size[3]
-      cut_rat = np.sqrt(1. - lam)
-      cut_w = np.int(W * cut_rat)
-      cut_h = np.int(H * cut_rat)
+      cut_rat = np.sqrt(1. - lam)  # lam = 
+      cut_w = int(W * cut_rat)
+      cut_h = int(H * cut_rat)
 
       # uniform
       cx = np.random.randint(W)
@@ -278,32 +392,6 @@ class CutMix(object):
 
       return bbx1, bby1, bbx2, bby2
 
-    def __call__(self, sits):
-      ts1, ts2 = sits
-
-      if np.random.rand() < self.p:
-        # Choose a random segment from the first time series
-        idx1 = np.random.randint(len(self.same_month_segs18))
-        start1, end1, month1 = self.same_month_segs18[idx1]
-
-          # Choose a random segment from the second time series of the same month
-        month2_segments = [(start2, end2) for start2, end2, month2 in self.same_month_segs19 if month2 == month1]
-        if len(month2_segments) > 0:
-          idx2 = np.random.randint(len(month2_segments))
-          start2, end2 = month2_segments[idx2]
-
-          # Ensure that both segments have the same length
-          seg_length = end1 - start1 + 1
-          if end2 - start2 + 1 >= seg_length:
-            # Apply the cutmix augmentation
-            lam = np.random.beta(self.alpha, self.beta)
-            lam = max(lam, 1 - lam)
-            bbx1, bby1, bbx2, bby2 = rand_bbox(ts1.shape, lam)
-            ts1[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * self.mask + ts1[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask)
-            ts2[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask) + ts1[:, :, bbx1:bbx2, bby1:bby2] * self.mask
-
-      return ts1, ts2
-
 class TrainTransform(object):
   def __init__(self):
     self.transform = transforms.Compose([
@@ -311,7 +399,8 @@ class TrainTransform(object):
         Scaling(p = 1.0, sigma = 0.1),
         WindowSlice(p=0.8,  magnitude= 0.1),
         WindowWarp(p=0.5, date_dir1= d_path18, date_dir2= d_path19, timeframe = "monthly", scale=[0.5, 2.0]),
-        CutMix(p=0.5, date_dir1 = d_path18, date_dir2 = d_path19, timeframe="monthly", alpha=1.0, beta=1.0),
+        Resample(p= 0.5, date_dir1 = d_path18, date_dir2 = d_path19),
+        CutMix(p=0.5, date_dir1 = d_path18, date_dir2 = d_path19, timeframe="monthly", alpha=1.0, beta=1.0)
 
     ])
     self.transform_prime = transforms.Compose([
@@ -319,7 +408,8 @@ class TrainTransform(object):
         Scaling(p = 1.0, sigma = 1.0),
         WindowSlice(p=0.2,  magnitude= 0.1),
         WindowWarp(p=0.5, date_dir1= d_path18, date_dir2= d_path19, timeframe = "monthly", scale=[0.5, 2.0]),
-        CutMix(p=0.5, date_dir1 = d_path18, date_dir2 = d_path19, timeframe="monthly", alpha=1.0, beta=1.0),
+        Resample(p= 0.5, date_dir1 = d_path18, date_dir2 = d_path19),
+        CutMix(p=0.5, date_dir1 = d_path18, date_dir2 = d_path19, timeframe="monthly", alpha=1.0, beta=1.0)
     ])
 
   def __call__(self,sample):
