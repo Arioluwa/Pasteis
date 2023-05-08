@@ -268,12 +268,13 @@ class Resample(object):
 
     return downsampled_data, downsampled_dates
 
+
 class CutMix(object):
-    def __init__(self, p, timeframe="", alpha=0, beta=0):
+    def __init__(self, p,  alpha=0, beta=0, timeframe=""):
       self.p = p
       self.alpha = alpha
       self.beta = beta
-      self.mask = np.random.beta(self.alpha, self.beta)
+      
 
       if timeframe==None:
         self.timeframe = "monthly"
@@ -283,79 +284,60 @@ class CutMix(object):
     def __call__(self, sits):
       ts1, ts2 , dates = sits
       dates1 , dates2 = dates
-
+      self.mask = np.random.beta(self.alpha, self.beta)
       segs18 = self.create_s(dates1)
       segs19 = self.create_s(dates2)
       same_month_segs18, same_month_segs19 = self.compare_segments(segs18, segs19)
+      
       # Choose a random segment from the first time series
       idx1 = np.random.randint(len(same_month_segs18))
-      start1, end1, month1 = same_month_segs18[idx1]
+      start1, end1, month1 = same_month_segs18[idx1]       
 
       # Choose a random segment from the second time series of the same month
-      month2_segments = [(start2, end2) for start2, end2, month2 in same_month_segs19 if month2 == month1]
-      if len(month2_segments) > 0:
-        idx2 = np.random.randint(len(month2_segments))
-        start2, end2 = month2_segments[idx2]
+      start2, end2, _ = None, None, None
+      for i, m_seg in enumerate(same_month_segs19):
+        if m_seg[2] == month1:
+            start2, end2, _ = same_month_segs19[i]
+            break
 
-        # Ensure that both segments have the same length
-        seg_length = end1 - start1 + 1
-        if end2 - start2 + 1 >= seg_length:
-          # Apply the cutmix augmentation
-          lam = np.random.beta(self.alpha, self.beta)
-          lam = max(lam, 1 - lam)
-          bbx1, bby1, bbx2, bby2 = self.rand_bbox(ts1.shape, lam)
-          ts1[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * self.mask + ts1[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask)
-          ts2[:, :, bbx1:bbx2, bby1:bby2] = ts2[:, :, bbx1:bbx2, bby1:bby2] * (1. - self.mask) + ts1[:, :, bbx1:bbx2, bby1:bby2] * self.mask
+      # cutmix augmentation
+      num_channels = ts1.shape[1]
+      for channel in range(num_channels):
+        ts1[start1:end1+1, channel, :, :] = ts2[start1:end1+1, channel, :, :] * self.mask + ts1[start1:end1+1, channel,  :, :] * (1. - self.mask)
+        ts2[start2:end2+1, channel,  :, :] = ts2[start2:end2+1, channel,  :, :] * (1. - self.mask) + ts1[start2:end2+1, channel,  :, :] * self.mask
 
-      return ts1, ts2
+      return ts1, ts2 , dates
 
-    def create_s(self, dates):
+    def create_s(self, dates): # creates monthly segments and attach each month for identification
       segments = []
-      curr_month = dates[0].split('-')[1]
-      curr_start = 0
+      start_index = 0
+      end_index = 0
+      current_month = dates[0].split('-')[1]
       for i in range(1, len(dates)):
-        month = dates[i].split('-')[1]
-        if month != curr_month:
-          curr_end = i - 1
-          if curr_end - curr_start >= 2:
-            segments.append((curr_start, curr_end, curr_month))
-            curr_month = month
-            curr_start = i
-      curr_end = len(dates) - 1
-      if curr_end - curr_start >= 2:
-        segments.append((curr_start, curr_end, curr_month))
+          if dates[i].split('-')[1] != current_month:
+              segments.append((start_index, end_index, str(current_month)))
+              start_index = i
+              current_month = dates[i].split('-')[1]
+          end_index = i
+      segments.append((start_index, end_index, str(current_month)))
       return segments
 
-    def compare_segments(self, segs1, segs2):
+    def compare_segments(self,segs1, segs2):
       same_month_segs1 = []
       same_month_segs2 = []
       for seg in segs1:
-        month = seg[2]
-        for other_seg in segs2:
-          if other_seg[2] == month:
-            same_month_segs1.append(seg)
-            same_month_segs2.append(other_seg)
-            break
+          month = seg[2]
+          if (seg[1]-seg[0] + 1) >= 3:
+              for other_seg in segs2:
+                  if other_seg[2] == month and (other_seg[1]-other_seg[0] + 1) >= 3:
+                      same_month_segs1.append(seg)
+                      same_month_segs2.append(other_seg)
+                      break          
       return same_month_segs1, same_month_segs2
 
+   
 
-    def rand_bbox(self, size, lam):
-      W = size[2]
-      H = size[3]
-      cut_rat = np.sqrt(1. - lam)  # lam = 
-      cut_w = int(W * cut_rat)
-      cut_h = int(H * cut_rat)
 
-      # uniform
-      cx = np.random.randint(W)
-      cy = np.random.randint(H)
-
-      bbx1 = np.clip(cx - cut_w // 2, 0, W)
-      bby1 = np.clip(cy - cut_h // 2, 0, H)
-      bbx2 = np.clip(cx + cut_w // 2, 0, W)
-      bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-      return bbx1, bby1, bbx2, bby2
 
 class TrainTransform(object):
   def __init__(self):
