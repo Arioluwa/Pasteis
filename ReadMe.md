@@ -1,3 +1,3 @@
 # PASTEIS PROJECT
  
- Self Supervised Learning For the Pasteis Project (Masters Thesis)
+ Self Supervised Learning Techniques for Change Detection(Masters Thesis)
