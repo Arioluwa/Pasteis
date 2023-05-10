@@ -30,7 +30,7 @@ def get_arguments():
     parser = argparse.ArgumentParser(description="Pretrain a u_ltae model with VICReg", add_help=False)
 
     # Data
-    parser.add_argument("--data-dir", type=Path, default="/path/to/imagenet", required=True,
+    parser.add_argument("--data-dir", type=Path, default="/path/to/dataset", required=True,
                         help='Path to the image net dataset')
 
     # Checkpoints
