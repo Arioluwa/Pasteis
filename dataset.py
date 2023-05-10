@@ -3,17 +3,15 @@ import os
 import torch
 import numpy as np
 import pandas as pd
-import random
 import rasterio as rio
-from scipy.interpolate import interp1d
 import datetime
 import torch.utils.data 
 from torch.utils.data import Dataset, DataLoader, random_split
-from itertools import islice
+import torch.utils.data as tdata
 import torchvision.transforms as transforms
 
 
-class SITSDataset(Dataset):
+class SITSDataset(tdata.Dataset):
   def __init__(
       self, folder, norm = True,transform = None,year = ['2018', '2019']):
     super(SITSDataset, self).__init__()

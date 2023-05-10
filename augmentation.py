@@ -342,27 +342,27 @@ class CutMix(object):
 class TrainTransform(object):
   def __init__(self):
     self.transform = transforms.Compose([
-        Jittering(p= 0.9, sigma = 0.03),
-        Scaling(p = 0.9, sigma = 0.1),
-        WindowSlice(p=0.8,  magnitude= 0.1),
-        WindowWarp(p=0.5, timeframe = "monthly", scale=[0.5, 2.0]),
+        Jittering(p= 1.0, sigma = 0.03),
+        Scaling(p = 1.0, sigma = 0.1),
+        WindowSlice(p=0.8,  magnitude= 0.9),
+        WindowWarp(p=0.5,timeframe = "monthly", scale=[0.5, 2.0]),
         Resample(p= 0.5),
-        CutMix(p=0.5, timeframe="monthly", alpha=1.0, beta=1.0)
+        CutMix(p=0.5,  alpha=1.0, beta=1.0, timeframe="monthly")
 
     ])
     self.transform_prime = transforms.Compose([
-        Jittering(p= 0.9, sigma = 0.03),
-        Scaling(p = 0.9, sigma = 0.1),
-        WindowSlice(p=0.2,  magnitude= 0.1),
+        Jittering(p= 0.1, sigma = 0.03),
+        Scaling(p = 1.0, sigma = 1.0),
+        WindowSlice(p=0.2,  magnitude= 0.1),                
         WindowWarp(p=0.5, timeframe = "monthly", scale=[0.5, 2.0]),
         Resample(p= 0.5),
-        CutMix(p=0.5, timeframe="monthly", alpha=1.0, beta=1.0)
+        CutMix(p=0.5, alpha=1.0, beta=1.0, timeframe="monthly")
     ])
 
-  def __call__(self,sample, dates):
+  def __call__(self,sample):
     
-    x = self.transform(sample, dates)
-    x_prime = self.transform(sample, dates)
+    x = self.transform(sample)
+    x_prime = self.transform(sample)
 
     return x, x_prime
 

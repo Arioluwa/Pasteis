@@ -1,411 +1,416 @@
 """
-Main script for semantic experiments
+U-TAE Implementation
 Author: Vivien Sainte Fare Garnot (github/VSainteuf)
 License: MIT
 """
-import argparse
-import json
-import os
-import pickle as pkl
-import pprint
-import time
-
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.utils.data as data
-import torchnet as tnt
-
-from src import utils, model_utils
-from src.dataset import PASTIS_Dataset
-from src.learning.metrics import confusion_matrix_analysis
-from src.learning.miou import IoU
-from src.learning.weight_init import weight_init
-
-parser = argparse.ArgumentParser()
-# Model parameters
-parser.add_argument(
-    "--model",
-    default="utae",
-    type=str,
-    help="Type of architecture to use. Can be one of: (utae/unet3d/fpn/convlstm/convgru/uconvlstm/buconvlstm)",
-)
-## U-TAE Hyperparameters
-parser.add_argument("--encoder_widths", default="[64,64,64,128]", type=str)
-parser.add_argument("--decoder_widths", default="[32,32,64,128]", type=str)
-parser.add_argument("--out_conv", default="[32, 20]")
-parser.add_argument("--str_conv_k", default=4, type=int)
-parser.add_argument("--str_conv_s", default=2, type=int)
-parser.add_argument("--str_conv_p", default=1, type=int)
-parser.add_argument("--agg_mode", default="att_group", type=str)
-parser.add_argument("--encoder_norm", default="group", type=str)
-parser.add_argument("--n_head", default=16, type=int)
-parser.add_argument("--d_model", default=256, type=int)
-parser.add_argument("--d_k", default=4, type=int)
-
-# Set-up parameters
-parser.add_argument(
-    "--dataset_folder",
-    default="",
-    type=str,
-    help="Path to the folder where the results are saved.",
-)
-parser.add_argument(
-    "--res_dir",
-    default="./results",
-    help="Path to the folder where the results should be stored",
-)
-parser.add_argument(
-    "--num_workers", default=8, type=int, help="Number of data loading workers"
-)
-parser.add_argument("--rdm_seed", default=1, type=int, help="Random seed")
-parser.add_argument(
-    "--device",
-    default="cuda",
-    type=str,
-    help="Name of device to use for tensor computations (cuda/cpu)",
-)
-parser.add_argument(
-    "--display_step",
-    default=50,
-    type=int,
-    help="Interval in batches between display of training metrics",
-)
-parser.add_argument(
-    "--cache",
-    dest="cache",
-    action="store_true",
-    help="If specified, the whole dataset is kept in RAM",
-)
-# Training parameters
-parser.add_argument("--epochs", default=100, type=int, help="Number of epochs per fold")
-parser.add_argument("--batch_size", default=4, type=int, help="Batch size")
-parser.add_argument("--lr", default=0.001, type=float, help="Learning rate")
-parser.add_argument("--mono_date", default=None, type=str)
-parser.add_argument("--ref_date", default="2018-09-01", type=str)
-parser.add_argument(
-    "--fold",
-    default=None,
-    type=int,
-    help="Do only one of the five fold (between 1 and 5)",
-)
-parser.add_argument("--num_classes", default=20, type=int)
-parser.add_argument("--ignore_index", default=-1, type=int)
-parser.add_argument("--pad_value", default=0, type=float)
-parser.add_argument("--padding_mode", default="reflect", type=str)
-parser.add_argument(
-    "--val_every",
-    default=1,
-    type=int,
-    help="Interval in epochs between two validation steps.",
-)
-parser.add_argument(
-    "--val_after",
-    default=0,
-    type=int,
-    help="Do validation only after that many epochs.",
-)
-
-list_args = ["encoder_widths", "decoder_widths", "out_conv"]
-parser.set_defaults(cache=False)
+from ltae import LTAE2d
 
 
-def iterate(
-    model, data_loader, criterion, config, optimizer=None, mode="train", device=None
-):
-    loss_meter = tnt.meter.AverageValueMeter()
-    iou_meter = IoU(
-        num_classes=config.num_classes,
-        ignore_index=config.ignore_index,
-        cm_device=config.device,
-    )
+class UTAE(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        encoder_widths=[64, 64, 64, 128],
+        decoder_widths=[32, 32, 64, 128],
+        out_conv=[32, 20],
+        str_conv_k=4,
+        str_conv_s=2,
+        str_conv_p=1,
+        agg_mode="att_group",
+        encoder_norm="group",
+        n_head=16,
+        d_model=256,
+        d_k=4,
+        encoder=False,
+        return_maps=False,
+        pad_value=0,
+        padding_mode="reflect",
+    ):
+        """
+        U-TAE architecture for spatio-temporal encoding of satellite image time series.
+        Args:
+            input_dim (int): Number of channels in the input images.
+            encoder_widths (List[int]): List giving the number of channels of the successive encoder_widths of the convolutional encoder.
+            This argument also defines the number of encoder_widths (i.e. the number of downsampling steps +1)
+            in the architecture.
+            The number of channels are given from top to bottom, i.e. from the highest to the lowest resolution.
+            decoder_widths (List[int], optional): Same as encoder_widths but for the decoder. The order in which the number of
+            channels should be given is also from top to bottom. If this argument is not specified the decoder
+            will have the same configuration as the encoder.
+            out_conv (List[int]): Number of channels of the successive convolutions for the
+            str_conv_k (int): Kernel size of the strided up and down convolutions.
+            str_conv_s (int): Stride of the strided up and down convolutions.
+            str_conv_p (int): Padding of the strided up and down convolutions.
+            agg_mode (str): Aggregation mode for the skip connections. Can either be:
+                - att_group (default) : Attention weighted temporal average, using the same
+                channel grouping strategy as in the LTAE. The attention masks are bilinearly
+                resampled to the resolution of the skipped feature maps.
+                - att_mean : Attention weighted temporal average,
+                 using the average attention scores across heads for each date.
+                - mean : Temporal average excluding padded dates.
+            encoder_norm (str): Type of normalisation layer to use in the encoding branch. Can either be:
+                - group : GroupNorm (default)
+                - batch : BatchNorm
+                - instance : InstanceNorm
+            n_head (int): Number of heads in LTAE.
+            d_model (int): Parameter of LTAE
+            d_k (int): Key-Query space dimension
+            encoder (bool): If true, the feature maps instead of the class scores are returned (default False)
+            return_maps (bool): If true, the feature maps instead of the class scores are returned (default False)
+            pad_value (float): Value used by the dataloader for temporal padding.
+            padding_mode (str): Spatial padding strategy for convolutional layers (passed to nn.Conv2d).
+        """
+        super(UTAE, self).__init__()
+        self.n_stages = len(encoder_widths)
+        self.return_maps = return_maps
+        self.encoder_widths = encoder_widths
+        self.decoder_widths = decoder_widths
+        self.enc_dim = (
+            decoder_widths[0] if decoder_widths is not None else encoder_widths[0]
+        )
+        self.stack_dim = (
+            sum(decoder_widths) if decoder_widths is not None else sum(encoder_widths)
+        )
+        self.pad_value = pad_value
+        self.encoder = encoder
+        if encoder:
+            self.return_maps = True
 
-    t_start = time.time()
-    for i, batch in enumerate(data_loader):
-        if device is not None:
-            batch = recursive_todevice(batch, device)
-        (x, dates), y = batch
-        y = y.long()
-
-        if mode != "train":
-            with torch.no_grad():
-                out = model(x, batch_positions=dates)
+        if decoder_widths is not None:
+            assert len(encoder_widths) == len(decoder_widths)
+            assert encoder_widths[-1] == decoder_widths[-1]
         else:
-            optimizer.zero_grad()
-            out = model(x, batch_positions=dates)
+            decoder_widths = encoder_widths
 
-        loss = criterion(out, y)
-        if mode == "train":
-            loss.backward()
-            optimizer.step()
-
-        with torch.no_grad():
-            pred = out.argmax(dim=1)
-        iou_meter.add(pred, y)
-        loss_meter.add(loss.item())
-
-        if (i + 1) % config.display_step == 0:
-            miou, acc = iou_meter.get_miou_acc()
-            print(
-                "Step [{}/{}], Loss: {:.4f}, Acc : {:.2f}, mIoU {:.2f}".format(
-                    i + 1, len(data_loader), loss_meter.value()[0], acc, miou
-                )
+        self.in_conv = ConvBlock(
+            nkernels=[input_dim] + [encoder_widths[0], encoder_widths[0]],
+            pad_value=pad_value,
+            norm=encoder_norm,
+            padding_mode=padding_mode,
+        )
+        self.down_blocks = nn.ModuleList(
+            DownConvBlock(
+                d_in=encoder_widths[i],
+                d_out=encoder_widths[i + 1],
+                k=str_conv_k,
+                s=str_conv_s,
+                p=str_conv_p,
+                pad_value=pad_value,
+                norm=encoder_norm,
+                padding_mode=padding_mode,
             )
-
-    t_end = time.time()
-    total_time = t_end - t_start
-    print("Epoch time : {:.1f}s".format(total_time))
-    miou, acc = iou_meter.get_miou_acc()
-    metrics = {
-        "{}_accuracy".format(mode): acc,
-        "{}_loss".format(mode): loss_meter.value()[0],
-        "{}_IoU".format(mode): miou,
-        "{}_epoch_time".format(mode): total_time,
-    }
-
-    if mode == "test":
-        return metrics, iou_meter.conf_metric.value()  # confusion matrix
-    else:
-        return metrics
-
-
-def recursive_todevice(x, device):
-    if isinstance(x, torch.Tensor):
-        return x.to(device)
-    elif isinstance(x, dict):
-        return {k: recursive_todevice(v, device) for k, v in x.items()}
-    else:
-        return [recursive_todevice(c, device) for c in x]
-
-
-def prepare_output(config):
-    os.makedirs(config.res_dir, exist_ok=True)
-    for fold in range(1, 6):
-        os.makedirs(os.path.join(config.res_dir, "Fold_{}".format(fold)), exist_ok=True)
-
-
-def checkpoint(fold, log, config):
-    with open(
-        os.path.join(config.res_dir, "Fold_{}".format(fold), "trainlog.json"), "w"
-    ) as outfile:
-        json.dump(log, outfile, indent=4)
-
-
-def save_results(fold, metrics, conf_mat, config):
-    with open(
-        os.path.join(config.res_dir, "Fold_{}".format(fold), "test_metrics.json"), "w"
-    ) as outfile:
-        json.dump(metrics, outfile, indent=4)
-    pkl.dump(
-        conf_mat,
-        open(
-            os.path.join(config.res_dir, "Fold_{}".format(fold), "conf_mat.pkl"), "wb"
-        ),
-    )
-
-
-def overall_performance(config):
-    cm = np.zeros((config.num_classes, config.num_classes))
-    for fold in range(1, 6):
-        cm += pkl.load(
-            open(
-                os.path.join(config.res_dir, "Fold_{}".format(fold), "conf_mat.pkl"),
-                "rb",
+            for i in range(self.n_stages - 1)
+        )
+        self.up_blocks = nn.ModuleList(
+            UpConvBlock(
+                d_in=decoder_widths[i],
+                d_out=decoder_widths[i - 1],
+                d_skip=encoder_widths[i - 1],
+                k=str_conv_k,
+                s=str_conv_s,
+                p=str_conv_p,
+                norm="batch",
+                padding_mode=padding_mode,
             )
+            for i in range(self.n_stages - 1, 0, -1)
         )
-
-    if config.ignore_index is not None:
-        cm = np.delete(cm, config.ignore_index, axis=0)
-        cm = np.delete(cm, config.ignore_index, axis=1)
-
-    _, perf = confusion_matrix_analysis(cm)
-
-    print("Overall performance:")
-    print("Acc: {},  IoU: {}".format(perf["Accuracy"], perf["MACRO_IoU"]))
-
-    with open(os.path.join(config.res_dir, "overall.json"), "w") as file:
-        file.write(json.dumps(perf, indent=4))
-
-
-def main(config):
-    fold_sequence = [
-        [[1, 2, 3], [4], [5]],
-        [[2, 3, 4], [5], [1]],
-        [[3, 4, 5], [1], [2]],
-        [[4, 5, 1], [2], [3]],
-        [[5, 1, 2], [3], [4]],
-    ]
-
-    np.random.seed(config.rdm_seed)
-    torch.manual_seed(config.rdm_seed)
-    prepare_output(config)
-    device = torch.device(config.device)
-
-    fold_sequence = (
-        fold_sequence if config.fold is None else [fold_sequence[config.fold - 1]]
-    )
-    for fold, (train_folds, val_fold, test_fold) in enumerate(fold_sequence):
-        if config.fold is not None:
-            fold = config.fold - 1
-
-        # Dataset definition
-        dt_args = dict(
-            folder=config.dataset_folder,
-            norm=True,
-            reference_date=config.ref_date,
-            mono_date=config.mono_date,
-            target="semantic",
-            sats=["S2"],
+        self.temporal_encoder = LTAE2d(
+            in_channels=encoder_widths[-1],
+            d_model=d_model,
+            n_head=n_head,
+            mlp=[d_model, encoder_widths[-1]],
+            return_att=True,
+            d_k=d_k,
         )
+        self.temporal_aggregator = Temporal_Aggregator(mode=agg_mode)
+        self.out_conv = ConvBlock(nkernels=[decoder_widths[0]] + out_conv, padding_mode=padding_mode)
 
-        dt_train = PASTIS_Dataset(**dt_args, folds=train_folds, cache=config.cache)
-        dt_val = PASTIS_Dataset(**dt_args, folds=val_fold, cache=config.cache)
-        dt_test = PASTIS_Dataset(**dt_args, folds=test_fold)
-
-        collate_fn = lambda x: utils.pad_collate(x, pad_value=config.pad_value)
-        train_loader = data.DataLoader(
-            dt_train,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=collate_fn,
+    def forward(self, input, batch_positions=None, return_att=False):
+        pad_mask = (
+            (input == self.pad_value).all(dim=-1).all(dim=-1).all(dim=-1)
+        )  # BxT pad mask
+        out = self.in_conv.smart_forward(input)
+        feature_maps = [out]
+        # SPATIAL ENCODER
+        for i in range(self.n_stages - 1):
+            out = self.down_blocks[i].smart_forward(feature_maps[-1])
+            feature_maps.append(out)
+        # TEMPORAL ENCODER
+        out, att = self.temporal_encoder(
+            feature_maps[-1], batch_positions=batch_positions, pad_mask=pad_mask
         )
-        val_loader = data.DataLoader(
-            dt_val,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=collate_fn,
-        )
-        test_loader = data.DataLoader(
-            dt_test,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=collate_fn,
-        )
-
-        print(
-            "Train {}, Val {}, Test {}".format(len(dt_train), len(dt_val), len(dt_test))
-        )
-
-        # Model definition
-        model = model_utils.get_model(config, mode="semantic")
-        config.N_params = utils.get_ntrainparams(model)
-        with open(os.path.join(config.res_dir, "conf.json"), "w") as file:
-            file.write(json.dumps(vars(config), indent=4))
-        print(model)
-        print("TOTAL TRAINABLE PARAMETERS :", config.N_params)
-        print("Trainable layers:")
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                print(name)
-        model = model.to(device)
-        model.apply(weight_init)
-
-        # Optimizer and Loss
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-
-        weights = torch.ones(config.num_classes, device=device).float()
-        weights[config.ignore_index] = 0
-        criterion = nn.CrossEntropyLoss(weight=weights)
-
-        # Training loop
-        trainlog = {}
-        best_mIoU = 0
-        for epoch in range(1, config.epochs + 1):
-            print("EPOCH {}/{}".format(epoch, config.epochs))
-
-            model.train()
-            train_metrics = iterate(
-                model,
-                data_loader=train_loader,
-                criterion=criterion,
-                config=config,
-                optimizer=optimizer,
-                mode="train",
-                device=device,
+        # SPATIAL DECODER
+        if self.return_maps:
+            maps = [out]
+        for i in range(self.n_stages - 1):
+            skip = self.temporal_aggregator(
+                feature_maps[-(i + 2)], pad_mask=pad_mask, attn_mask=att
             )
-            if epoch % config.val_every == 0 and epoch > config.val_after:
-                print("Validation . . . ")
-                model.eval()
-                val_metrics = iterate(
-                    model,
-                    data_loader=val_loader,
-                    criterion=criterion,
-                    config=config,
-                    optimizer=optimizer,
-                    mode="val",
-                    device=device,
-                )
+            out = self.up_blocks[i](out, skip)
+            if self.return_maps:
+                maps.append(out)
 
-                print(
-                    "Loss {:.4f},  Acc {:.2f},  IoU {:.4f}".format(
-                        val_metrics["val_loss"],
-                        val_metrics["val_accuracy"],
-                        val_metrics["val_IoU"],
-                    )
-                )
-
-                trainlog[epoch] = {**train_metrics, **val_metrics}
-                checkpoint(fold + 1, trainlog, config)
-                if val_metrics["val_IoU"] >= best_mIoU:
-                    best_mIoU = val_metrics["val_IoU"]
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "state_dict": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                        },
-                        os.path.join(
-                            config.res_dir, "Fold_{}".format(fold + 1), "model.pth.tar"
-                        ),
-                    )
+        if self.encoder:
+            return out, maps
+        else:
+            out = self.out_conv(out)
+            if return_att:
+                return out, att
+            if self.return_maps:
+                return out, maps
             else:
-                trainlog[epoch] = {**train_metrics}
-                checkpoint(fold + 1, trainlog, config)
+                return out
 
-        print("Testing best epoch . . .")
-        model.load_state_dict(
-            torch.load(
-                os.path.join(
-                    config.res_dir, "Fold_{}".format(fold + 1), "model.pth.tar"
-                )
-            )["state_dict"]
-        )
-        model.eval()
 
-        test_metrics, conf_mat = iterate(
-            model,
-            data_loader=test_loader,
-            criterion=criterion,
-            config=config,
-            optimizer=optimizer,
-            mode="test",
-            device=device,
-        )
-        print(
-            "Loss {:.4f},  Acc {:.2f},  IoU {:.4f}".format(
-                test_metrics["test_loss"],
-                test_metrics["test_accuracy"],
-                test_metrics["test_IoU"],
+class TemporallySharedBlock(nn.Module):
+    """
+    Helper module for convolutional encoding blocks that are shared across a sequence.
+    This module adds the self.smart_forward() method the the block.
+    smart_forward will combine the batch and temporal dimension of an input tensor
+    if it is 5-D and apply the shared convolutions to all the (batch x temp) positions.
+    """
+
+    def __init__(self, pad_value=None):
+        super(TemporallySharedBlock, self).__init__()
+        self.out_shape = None
+        self.pad_value = pad_value
+
+    def smart_forward(self, input):
+        if len(input.shape) == 4:
+            return self.forward(input)
+        else:
+            b, t, c, h, w = input.shape
+
+            if self.pad_value is not None:
+                dummy = torch.zeros(input.shape, device=input.device).float()
+                self.out_shape = self.forward(dummy.view(b * t, c, h, w)).shape
+
+            out = input.view(b * t, c, h, w)
+            if self.pad_value is not None:
+                pad_mask = (out == self.pad_value).all(dim=-1).all(dim=-1).all(dim=-1)
+                if pad_mask.any():
+                    temp = (
+                        torch.ones(
+                            self.out_shape, device=input.device, requires_grad=False
+                        )
+                        * self.pad_value
+                    )
+                    temp[~pad_mask] = self.forward(out[~pad_mask])
+                    out = temp
+                else:
+                    out = self.forward(out)
+            else:
+                out = self.forward(out)
+            _, c, h, w = out.shape
+            out = out.view(b, t, c, h, w)
+            return out
+
+
+class ConvLayer(nn.Module):
+    def __init__(
+        self,
+        nkernels,
+        norm="batch",
+        k=3,
+        s=1,
+        p=1,
+        n_groups=4,
+        last_relu=True,
+        padding_mode="reflect",
+    ):
+        super(ConvLayer, self).__init__()
+        layers = []
+        if norm == "batch":
+            nl = nn.BatchNorm2d
+        elif norm == "instance":
+            nl = nn.InstanceNorm2d
+        elif norm == "group":
+            nl = lambda num_feats: nn.GroupNorm(
+                num_channels=num_feats,
+                num_groups=n_groups,
             )
+        else:
+            nl = None
+        for i in range(len(nkernels) - 1):
+            layers.append(
+                nn.Conv2d(
+                    in_channels=nkernels[i],
+                    out_channels=nkernels[i + 1],
+                    kernel_size=k,
+                    padding=p,
+                    stride=s,
+                    padding_mode=padding_mode,
+                )
+            )
+            if nl is not None:
+                layers.append(nl(nkernels[i + 1]))
+
+            if last_relu:
+                layers.append(nn.ReLU())
+            elif i < len(nkernels) - 2:
+                layers.append(nn.ReLU())
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, input):
+        return self.conv(input)
+
+
+class ConvBlock(TemporallySharedBlock):
+    def __init__(
+        self,
+        nkernels,
+        pad_value=None,
+        norm="batch",
+        last_relu=True,
+        padding_mode="reflect",
+    ):
+        super(ConvBlock, self).__init__(pad_value=pad_value)
+        self.conv = ConvLayer(
+            nkernels=nkernels,
+            norm=norm,
+            last_relu=last_relu,
+            padding_mode=padding_mode,
         )
-        save_results(fold + 1, test_metrics, conf_mat.cpu().numpy(), config)
 
-    if config.fold is None:
-        overall_performance(config)
+    def forward(self, input):
+        return self.conv(input)
 
 
-if __name__ == "__main__":
-    config = parser.parse_args()
-    for k, v in vars(config).items():
-        if k in list_args and v is not None:
-            v = v.replace("[", "")
-            v = v.replace("]", "")
-            config.__setattr__(k, list(map(int, v.split(","))))
+class DownConvBlock(TemporallySharedBlock):
+    def __init__(
+        self,
+        d_in,
+        d_out,
+        k,
+        s,
+        p,
+        pad_value=None,
+        norm="batch",
+        padding_mode="reflect",
+    ):
+        super(DownConvBlock, self).__init__(pad_value=pad_value)
+        self.down = ConvLayer(
+            nkernels=[d_in, d_in],
+            norm=norm,
+            k=k,
+            s=s,
+            p=p,
+            padding_mode=padding_mode,
+        )
+        self.conv1 = ConvLayer(
+            nkernels=[d_in, d_out],
+            norm=norm,
+            padding_mode=padding_mode,
+        )
+        self.conv2 = ConvLayer(
+            nkernels=[d_out, d_out],
+            norm=norm,
+            padding_mode=padding_mode,
+        )
 
-    assert config.num_classes == config.out_conv[-1]
+    def forward(self, input):
+        out = self.down(input)
+        out = self.conv1(out)
+        out = out + self.conv2(out)
+        return out
 
-    pprint.pprint(config)
-    main(config)
+
+class UpConvBlock(nn.Module):
+    def __init__(
+        self, d_in, d_out, k, s, p, norm="batch", d_skip=None, padding_mode="reflect"
+    ):
+        super(UpConvBlock, self).__init__()
+        d = d_out if d_skip is None else d_skip
+        self.skip_conv = nn.Sequential(
+            nn.Conv2d(in_channels=d, out_channels=d, kernel_size=1),
+            nn.BatchNorm2d(d),
+            nn.ReLU(),
+        )
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels=d_in, out_channels=d_out, kernel_size=k, stride=s, padding=p
+            ),
+            nn.BatchNorm2d(d_out),
+            nn.ReLU(),
+        )
+        self.conv1 = ConvLayer(
+            nkernels=[d_out + d, d_out], norm=norm, padding_mode=padding_mode
+        )
+        self.conv2 = ConvLayer(
+            nkernels=[d_out, d_out], norm=norm, padding_mode=padding_mode
+        )
+
+    def forward(self, input, skip):
+        out = self.up(input)
+        out = torch.cat([out, self.skip_conv(skip)], dim=1)
+        out = self.conv1(out)
+        out = out + self.conv2(out)
+        return out
+
+
+class Temporal_Aggregator(nn.Module):
+    def __init__(self, mode="mean"):
+        super(Temporal_Aggregator, self).__init__()
+        self.mode = mode
+
+    def forward(self, x, pad_mask=None, attn_mask=None):
+        if pad_mask is not None and pad_mask.any():
+            if self.mode == "att_group":
+                n_heads, b, t, h, w = attn_mask.shape
+                attn = attn_mask.view(n_heads * b, t, h, w)
+
+                if x.shape[-2] > w:
+                    attn = nn.Upsample(
+                        size=x.shape[-2:], mode="bilinear", align_corners=False
+                    )(attn)
+                else:
+                    attn = nn.AvgPool2d(kernel_size=w // x.shape[-2])(attn)
+
+                attn = attn.view(n_heads, b, t, *x.shape[-2:])
+                attn = attn * (~pad_mask).float()[None, :, :, None, None]
+
+                out = torch.stack(x.chunk(n_heads, dim=2))  # hxBxTxC/hxHxW
+                out = attn[:, :, :, None, :, :] * out
+                out = out.sum(dim=2)  # sum on temporal dim -> hxBxC/hxHxW
+                out = torch.cat([group for group in out], dim=1)  # -> BxCxHxW
+                return out
+            elif self.mode == "att_mean":
+                attn = attn_mask.mean(dim=0)  # average over heads -> BxTxHxW
+                attn = nn.Upsample(
+                    size=x.shape[-2:], mode="bilinear", align_corners=False
+                )(attn)
+                attn = attn * (~pad_mask).float()[:, :, None, None]
+                out = (x * attn[:, :, None, :, :]).sum(dim=1)
+                return out
+            elif self.mode == "mean":
+                out = x * (~pad_mask).float()[:, :, None, None, None]
+                out = out.sum(dim=1) / (~pad_mask).sum(dim=1)[:, None, None, None]
+                return out
+        else:
+            if self.mode == "att_group":
+                n_heads, b, t, h, w = attn_mask.shape
+                attn = attn_mask.view(n_heads * b, t, h, w)
+                if x.shape[-2] > w:
+                    attn = nn.Upsample(
+                        size=x.shape[-2:], mode="bilinear", align_corners=False
+                    )(attn)
+                else:
+                    attn = nn.AvgPool2d(kernel_size=w // x.shape[-2])(attn)
+                attn = attn.view(n_heads, b, t, *x.shape[-2:])
+                out = torch.stack(x.chunk(n_heads, dim=2))  # hxBxTxC/hxHxW
+                out = attn[:, :, :, None, :, :] * out
+                out = out.sum(dim=2)  # sum on temporal dim -> hxBxC/hxHxW
+                out = torch.cat([group for group in out], dim=1)  # -> BxCxHxW
+                return out
+            elif self.mode == "att_mean":
+                attn = attn_mask.mean(dim=0)  # average over heads -> BxTxHxW
+                attn = nn.Upsample(
+                    size=x.shape[-2:], mode="bilinear", align_corners=False
+                )(attn)
+                out = (x * attn[:, :, None, :, :]).sum(dim=1)
+                return out
+            elif self.mode == "mean":
+                return x.mean(dim=1)
+
