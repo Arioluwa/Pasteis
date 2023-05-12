@@ -188,11 +188,11 @@ class VICReg(nn.Module):
         self.num_features = int(args.mlp.split("-")[-1])
         self.backbone, self.embedding = utae.__dict__[args.arch](
             zero_init_residual=True
-        )
+        ) #UTAE(encoder=True)
         self.projector = Projector(args, self.embedding)
 
     def forward(self, x, y):
-        x = self.projector(self.backbone(x))
+        x = self.projector(self.backbone(x)) # _, map, _ = self.projector
         y = self.projector(self.backbone(y))
 
         repr_loss = F.mse_loss(x, y)
