@@ -5,8 +5,6 @@ import numpy as np
 import pandas as pd
 import rasterio as rio
 import datetime
-import torch.utils.data 
-from torch.utils.data import Dataset, DataLoader, random_split
 import torch.utils.data as tdata
 import torchvision.transforms as transforms
 
@@ -23,12 +21,10 @@ class SITSDataset(tdata.Dataset):
     self.num_images =  self.sits18 + self.sits19
     self.dates18 = self.date_list(os.path.join(self.folder, f"{self.year18}_dates.txt"))
     self.dates19 = self.date_list(os.path.join(self.folder, f"{self.year19}_dates.txt"))
-    self.dates = (self.dates18, self.dates19)
   
   def __len__(self):
     return len(self.num_images)
 
-      
   def date_list(self, path):
     with open(path, 'r') as f:
         dates = f.readlines()
@@ -49,9 +45,6 @@ class SITSDataset(tdata.Dataset):
     sits_18 = self.sits18[index]
     sits_19 = self.sits19[index]
 
-    #date_18 = self.dates18[index]
-    #date_19 = self.dates19[index]
-
     sits_18 = self.load_img(sits_18, self.nbands)
     sits_19 = self.load_img(sits_19, self.nbands)
     
@@ -67,10 +60,18 @@ class SITSDataset(tdata.Dataset):
       self.norm_19 = transforms.Compose([transforms.Normalize(mean_19, std_19)])
 
       sits_18, sits_19 = self.norm_18(sits_18) , self.norm_19(sits_19)
-      sample = (sits_18, sits_19, self.dates)
+    
+    if np.random.rand() < 0.5:
+      dates = (self.dates18, self.dates19)
+      sample = (sits_18, sits_19, dates)
+    else:
+      dates = (self.dates19, self.dates18)
+      sample = (sits_19, sits_18, dates)      
 
-    # # Apply transforms
+    #  Apply transforms
     if self.transform is not None:
       sits_ = self.transform(sample)
       
     return sits_ 
+
+    

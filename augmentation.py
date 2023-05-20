@@ -1,91 +1,101 @@
-#!pip install rasterio
-import os
 import torch
 import numpy as np
-import pandas as pd
-import random
-import rasterio as rio
-import calendar
 from scipy.interpolate import interp1d
 import datetime
-from datetime import timedelta
-import torch.utils.data 
-from torch.utils.data import Dataset, DataLoader, random_split
-from itertools import islice
 import torchvision.transforms as transforms
 
 
 class Jittering(object):
     def __init__(self, p, sigma):
-        self.p = p
-        self.sigma = sigma
+      self.p = p
+      self.sigma = sigma
 
     def __call__(self, sits):
       # sits is a tuple of 2 time series and dates
       ts1, ts2, dates = sits
+
       if np.random.rand() < self.p:
-        jittered = ts1 + np.random.normal(loc=0., scale=self.sigma, size=ts1.shape) 
+        t1_jittered = ts1 + torch.normal(mean=0., std = self.sigma, size=(ts1.shape)) 
       else:
-        jittered = ts1
-      return jittered, ts2, dates
+        t1_jittered = ts1
+        
+      return t1_jittered, ts2, dates
       
       
-
-
+      
 class Scaling(object):
     def __init__(self, p, sigma):
-        self.p = p
-        self.sigma = sigma
+      self.p = p
+      self.sigma = sigma
 
     def __call__(self, sits):
-        # sits is a tuple of 2 time series and dates
+      # sits is a tuple of 2 time series and dates
       ts1, ts2, dates = sits
+
       if np.random.rand() < self.p:
-        scaled = np.multiply(ts1, np.random.normal(loc=1., scale=self.sigma, size=(ts1.shape[1],ts1.shape[2], ts1.shape[3])))
+        factor = torch.normal(mean=1., std = self.sigma, size=(ts1.shape[1], ts1.shape[2], ts1.shape[3]))
+        t1_scaled = torch.multiply(ts1, factor)
       else:
-        scaled = ts1
-      return scaled , ts2 , dates
+        t1_scaled = ts1
+
+      return t1_scaled , ts2 , dates
 
 
-class WindowSlice(object):
-    def __init__(self, p, magnitude):
+class Window_Interpolation(object):
+    def __init__(self, p, crop_range):
         self.p = p
-        self.magnitude = magnitude
+        self.crop_range = crop_range
 
     def __call__(self, sits):
       # sits is a tuple of 2 time series and dates
         ts1, ts2, dates = sits
+        dates1, _ = dates
+
         if np.random.rand() < self.p:
           # Perform window slicing on the first time series in the tuple
-          ts1_sliced = self._window_slice(ts1)
+          ts1_sliced = self._window_interp(ts1, dates1)
         else:
           ts1_sliced = ts1
 
         return ts1_sliced , ts2 , dates
 
-    def _window_slice(self, ts):
+    def day_of_year(self, date_list):
+      date_list = [d.strip() for d in date_list]
+      date_list = [datetime.datetime.strptime(d, "%Y-%m-%d").timetuple().tm_yday for d in date_list]
+      doy_s = [d for d in date_list]
+      return doy_s
+
+    def _window_interp(self, ts, dates):
         # ts is a 1D numpy array representing a time series
-        if not self.magnitude or self.magnitude <= 0 or self.magnitude >= 1:
-          return ts
         seq_len = ts.shape[0]
-        win_len = int(round(seq_len * (1 - self.magnitude)))
+        low, high = self.crop_range
+        crop_size = np.random.uniform(low, high)
+        # rand_num = torch.rand(1)
+        # crop_size = low + rand_num * (high - low)
+        doy = torch.tensor(self.day_of_year(dates))
+
+        win_len = int(round(seq_len * (1 - crop_size)))
         if win_len == seq_len:
             return ts
-        start = np.random.randint(0, seq_len - win_len)
+        start = int(torch.randint(0, seq_len - win_len, (1,)).item())
         end = start + win_len
 
-        x_old = np.linspace(0, 1, num=win_len)
-        x_new = np.linspace(0, 1, num=seq_len)
-        y_old = ts[start:end].numpy()
-        f = interp1d(x_old, y_old, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-        ts_interpolated = torch.from_numpy(f(x_new)).clone().detach()
-        ts[start:end] = ts_interpolated[start:end]
+        dates_a = torch.cat((doy[:start], doy[end+1:]))
+        ts_a = torch.cat((ts[:start],ts[end+1:]))
+
+        f = interp1d(dates_a, ts_a, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
+        ts_interpolated = torch.from_numpy(f(doy[start:end+1]))
+        ts[start:end+1] = ts_interpolated
+
         return ts
 
 
-class WindowWarp(object):
+
+class Window_Warping(object):
   def __init__(self, p, timeframe = None, scale=[None, None]):
     self.p = p
+    self.scale = scale
+
     if timeframe==None:
       if np.random.rand() < 0.5:
         self.timeframe = "monthly"
@@ -93,12 +103,11 @@ class WindowWarp(object):
         self.timeframe = "seasonal"
     else:
       self.timeframe = timeframe
-    self.scale = scale
-    self.scaling_factor = random.choice(self.scale)
+    
 
   def __call__(self, sits):
     ts1, ts2, dates = sits
-    dates1, dates2 = dates
+    dates1, _ = dates
     # Perform window slicing on both time series in the tuple
     if np.random.rand() < self.p:
       ts1_sliced = self._warp(ts1, dates1)
@@ -107,20 +116,34 @@ class WindowWarp(object):
     # Return the tuple of sliced time series
     return ts1_sliced , ts2 , dates
 
-  def create_months_segment(self, dates):
-      segments = []
-      curr_month = dates[0].split('-')[1]
-      curr_segment = [0]
-      for i in range(1, len(dates)):
-          month = dates[i].split('-')[1]
-          if month != curr_month:
-              segments.append(curr_segment)
-              curr_month = month
-              curr_segment = [i]
-          else:
-              curr_segment.append(i)
-      segments.append(curr_segment)
-      return segments
+  def day_of_year(self, date_list): 
+    date_list = [d.strip() for d in date_list]
+    date_list = [datetime.datetime.strptime(d, "%Y-%m-%d").timetuple().tm_yday for d in date_list]
+    date = [d for d in date_list]
+    return date
+
+  def create_months_segment(self, dates): 
+    segments = []
+    curr_month = int(dates[0].split('-')[1])
+    curr_segment = [datetime.datetime.strptime(dates[0], '%Y-%m-%d').timetuple().tm_yday]
+    for i in range(1, len(dates)):
+        month = int(dates[i].split('-')[1])
+        day_of_year = datetime.datetime.strptime(dates[i], '%Y-%m-%d').timetuple().tm_yday
+        if month != curr_month:
+            segments.append(curr_segment)
+            curr_month = month
+            curr_segment = [day_of_year]
+        else:
+            curr_segment.append(day_of_year)
+    segments.append(curr_segment)
+    return segments
+
+  def calculate_day_of_year(self, month, day):
+    days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    day_of_year = day
+    for i in range(month - 1):
+        day_of_year += days_in_month[i]
+    return day_of_year
 
 
 
@@ -128,148 +151,172 @@ class WindowWarp(object):
     segments = []
     curr_season = ""
     curr_segment = []
+    
     for i in range(len(dates)):
-      month = int(dates[i].split('-')[1])
-      if month in [12, 1, 2]:
-          season = "winter"
-      elif month in [3, 4, 5]:
-          season = "spring"
-      elif month in [6, 7, 8]:
-          season = "summer"
-      elif month in [9, 10, 11]:
-          season = "autumn"
-      if season != curr_season:
-          if curr_segment:
-              segments.append(curr_segment)
-          curr_season = season
-          curr_segment = []
-      curr_segment.append(i)
+        date_parts = dates[i].split('-')
+        month = int(date_parts[1])
+        day = int(date_parts[2])
+        day_of_year = self.calculate_day_of_year(month, day)
+        
+        if month in [12, 1, 2]:
+            season = "winter"
+        elif month in [3, 4, 5]:
+            season = "spring"
+        elif month in [6, 7, 8]:
+            season = "summer"
+        elif month in [9, 10, 11]:
+            season = "autumn"
+            
+        if season != curr_season:
+            if curr_segment:
+                segments.append(curr_segment)
+            curr_season = season
+            curr_segment = []
+            
+        curr_segment.append(day_of_year)
+    
     segments.append(curr_segment)
     return segments
 
+
   def _warp(self, ts, dates):
-    ts_dates = dates
-    ts = np.copy(ts) 
-    output_ts = np.zeros_like(ts)
+    doy = self.day_of_year(dates)
+    scaling_factor = np.random.choice(self.scale)
+    
     if self.timeframe == "monthly":
-      segments = self.create_months_segment(ts_dates) # segmented ts
+      segments = self.create_months_segment(dates) 
+    elif self.timeframe == "seasonal":
+      segments = self.create_seasonal_segment(dates) 
+    else:
+      raise ValueError("Invalid timeframe provided") 
 
-    if self.timeframe == "seasonal":
-      segments = self.create_seasonal_segment(ts_dates)  
+    segment = np.random.choice(segments)
 
-    segment = random.choice(segments)
-    #print(segment)
+    # start and end doy of chosen window segment
+    strt_doy = segment[0]  
+    end_doy = segment[-1]
 
-    # index the window segments
-    strt_idx = segment[0]  
-    end_idx = segment[-1]
-    first_seg = ts[:strt_idx,...]  # 1st part of the original time series 
-    last_seg = ts[end_idx+1:,...]  # other part of the original time series 
+    # convert the doy identity of the segments to indices of the time steps
+    indices=[]
+    for i, d_y in enumerate(doy):
+      if d_y == strt_doy:
+        indices.append(i)
+      if d_y == end_doy:
+        indices.append(i)
+
+    strt_idx = indices[0]
+    end_idx = indices[1]
     
-    # create the segment window to warp
-    window_b4_warp= ts[strt_idx:end_idx + 1] #.to_numpy()
-    window_b4_warp_steps = np.linspace(strt_idx, end_idx, end_idx - strt_idx + 1)
-    
-    #
-    warped_window_len = int(((end_idx - strt_idx) + 1) * self.scaling_factor)
-    new_steps = np.linspace(strt_idx, end_idx, warped_window_len)
-    
-    interp= interp1d(window_b4_warp_steps, window_b4_warp, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-    warped_segment = interp(new_steps)
-    
-    # interpolate the warped window and replace to return to the original dimension
-    concat_segms = np.concatenate((first_seg, warped_segment , last_seg))
-    concat_steps = np.linspace(0, concat_segms.shape[0],concat_segms.shape[0] )
-    output_steps = np.linspace(0, ts.shape[0], ts.shape[0])
+    dates_a = doy[:strt_idx] + doy[end_idx+1:]
 
-    interp_ = interp1d(concat_steps, concat_segms, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
-    output = interp_(output_steps)
-    output_ts = output
-    return output_ts
+    first_seg = ts[:strt_idx]  
+    last_seg = ts[end_idx+1:] 
+
+    ts_a = np.concatenate((first_seg, last_seg))
+
+    scaled_window_len = int((doy[end_idx]-doy[strt_idx]) * scaling_factor)
+    new_points = np.linspace(doy[strt_idx], doy[end_idx], num=scaled_window_len).astype(int)
+
+    f = interp1d(dates_a, ts_a, axis = 0, kind="linear", bounds_error=False, fill_value='extrapolate') 
+    ts_warped = f(new_points)
+
+    # second interpolation to return to original shape
+    concat_segs = np.concatenate((first_seg, ts_warped, last_seg))
+    newer_points = doy[:strt_idx] + list(new_points)+ doy[end_idx+1:] 
+
+    f2 = interp1d(newer_points, concat_segs, axis = 0, kind="linear", bounds_error=False, fill_value='extrapolate')
+    warped = torch.from_numpy(f2(doy))
+
+    return warped
 
 
-class Resample(object):
-  def __init__(self, p):
+class Resampling(object):
+  def __init__(self, p, num_new_dates, constant_ratio = None):
     self.p = p
+    self.num_new_dates = num_new_dates
+    self.constant_ratio = constant_ratio
     
   def __call__(self, sits):
     ts1, ts2, dates = sits
     date1, date2 = dates
-    self.samedates = self.common_dates(date1, date2)
-
-    if np.random.rand() < self.p:
-      resampled1, _ = self._resample(ts1, date1,year=2018)
-    else:
-      resampled1 = ts1  
-
-    return resampled1, ts2 , dates
-
-  def common_dates(self, datelist1, datelist2):
+    d_ = None
     
-    #with open(datelist1, 'r') as d1, open(datelist1, 'r') as d2:
-    list1 = [datetime.datetime.strptime(d, "%Y-%m-%d").timetuple().tm_yday for d in datelist1]
-    list2 = [datetime.datetime.strptime(d, "%Y-%m-%d").timetuple().tm_yday for d in datelist2]
+    if np.random.rand() < self.p:
+      resampled1, d_ = self._resample(ts1, date1)
+    else:
+      resampled1 = ts1 
 
-    common_dates = list(set(list1) & set(list2))
-    common_dates.sort()
-
-    return common_dates
-
+    dates = d_ , date2 
+    return resampled1, ts2 , dates
   
-  def get_date_from_yday(self, yday, year):
-      date = datetime(year, 1, 1) + timedelta(yday - 1)
-      return date.strftime("%Y-%m-%d")
+  def get_days_of_year(self, year):
+    days_of_year = []
+    days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]  # Number of days in each month
+    day_of_year = 1
+    for month, num_days in enumerate(days_in_month, start=1):  # Iterate through each month
+        for day in range(1, num_days + 1):  # Iterate through each day of the current month
+            days_of_year.append(day_of_year)
+            day_of_year += 1
+        if month == 12:
+            break  # Break the loop after adding the days of December
+    return days_of_year
 
-  def _resample(self, img, date_list,year=None):
-    # get the original dates of the sits
+
+  def day_of_year(self, dates): 
+    dates = [d.strip() for d in dates]
+    dates = [datetime.datetime.strptime(d, "%Y-%m-%d").timetuple().tm_yday for d in dates]
+    doy_s = [d for d in dates]
+    return doy_s
+
+  def convert_day_of_year_to_dates(self, day_of_year_list, year=None):
+    dates = []
+    for day_of_year in day_of_year_list:
+      day_of_year = day_of_year
+      date = datetime.datetime(int(year), 1, 1) + datetime.timedelta(int(day_of_year) - 1)
+      date_string = date.strftime("%Y-%m-%d")
+      dates.append(date_string)
+    return dates
+
+
+  def _resample(self, ts, dates):
+    year = dates[0].split('-')[0]
+    acq_doy = self.day_of_year(dates)
+    entire_doy = self.get_days_of_year(year)
+    num_dates_to_keep_unchanged = int(round(ts.shape[0] * self.constant_ratio))
+    
+    acquisition_day_1 = acq_doy[0]
+    acquisition_day_last = acq_doy[-1]
   
-    acquisition_dates = date_list
-    # Create list of all dates in 2018
-    year_dates = []
-    for month in range(1, 13):
-        num_days = calendar.monthrange(year, month)[1]
-        for day in range(1, num_days+1):
-            date_str = f'year-{month:02d}-{day:02d}'
-            year_dates.append(date_str)
+    all_dates_within_bounds = [yday for yday in entire_doy if acquisition_day_1 <= yday <= acquisition_day_last]
 
-    # Create new array to hold upsampled data
-    upsampled_data = np.zeros((365, 10, 64, 64))
-    interpolated_dates = []
-    upsampled_dates = []
-    #upsample data
-    for i, date in enumerate(year_dates):
-      if date in acquisition_dates:
-        # Copy corresponding image data to new array
-        index = acquisition_dates.index(date)
-        upsampled_data[i] = img[index]
-      else:
-        interpolated_dates.append(date)
-        # Perform interpolation to generate new image
-        f = interp1d(np.arange(img.shape[0]), img, axis=0, kind='linear')
-        upsampled_data[i] = f(i % img.shape[0])
-    upsampled_dates = acquisition_dates + interpolated_dates
+    dates_to_choose_from = []
+    for d in all_dates_within_bounds:
+        if d not in acq_doy:
+            dates_to_choose_from.append(d)
+
+    chosen_dates = np.random.choice(dates_to_choose_from, size=self.num_new_dates, replace=False)
+    upsampled_dates = list(chosen_dates) + acq_doy
     upsampled_dates.sort()
+    f = interp1d(acq_doy, ts, axis = 0, kind="linear", bounds_error=False, fill_value= 'extrapolate')
+    upsampled_ts = f(upsampled_dates)
 
-    no_change_dates = [self.get_date_from_yday(yday, year) for yday in self.same_dates]
-    downsampled_data = np.zeros((img.shape))
-    downsampled_dates = []
-    for i, dt in enumerate(upsampled_dates):
-      if dt in no_change_dates:
-        idx = no_change_dates.index(dt)
-        downsampled_data[idx] = upsampled_data[i]
-        downsampled_dates.append(dt)
-       
-    random_indices = random.sample(range(0, 366), 20)
-    for i, index in enumerate(random_indices):
-        if upsampled_dates[index] not in no_change_dates:
-            downsampled_data[i + len(no_change_dates)] = upsampled_data[index]
-        downsampled_dates.append(upsampled_dates[index])
-        downsampled_dates.sort()
+    # downsample the new data back to the original shape, keeping some dates from the initial acquisition constant, interpolate other points
+    constant_dates = np.random.choice(acq_doy, size = num_dates_to_keep_unchanged, replace = False)
+    dates_to_choose_from2 = []
+    for d in upsampled_dates:
+      if d not in constant_dates:
+        dates_to_choose_from2.append(d)
+    chosen_dates2 = np.random.choice(dates_to_choose_from2, size = len(acq_doy) - num_dates_to_keep_unchanged , replace = False )
+    downsampled_dates = list(chosen_dates2)  + list(constant_dates )
+    downsampled_dates.sort()
+    f2 = interp1d(upsampled_dates, upsampled_ts, axis = 0, kind="linear", bounds_error=False, fill_value= 'extrapolate' )
+    downsampled_ts = torch.from_numpy(f2(downsampled_dates))
+    downsampled_dates_ = self.convert_day_of_year_to_dates(downsampled_dates, year)
 
-    return downsampled_data, downsampled_dates
+    return downsampled_ts, downsampled_dates_
 
 
-class CutMix(object):
+class Cut_Mixing(object):
     def __init__(self, p,  alpha=0, beta=0, timeframe=""):
       self.p = p
       self.alpha = alpha
@@ -284,13 +331,13 @@ class CutMix(object):
     def __call__(self, sits):
       ts1, ts2 , dates = sits
       dates1 , dates2 = dates
-      self.mask = np.random.beta(self.alpha, self.beta)
+      self.mask = torch.distributions.beta.Beta(self.alpha, self.beta).sample()
       segs18 = self.create_s(dates1)
       segs19 = self.create_s(dates2)
       same_month_segs18, same_month_segs19 = self.compare_segments(segs18, segs19)
       
       # Choose a random segment from the first time series
-      idx1 = np.random.randint(len(same_month_segs18))
+      idx1 = torch.randint(len(same_month_segs18), (1,))
       start1, end1, month1 = same_month_segs18[idx1]       
 
       # Choose a random segment from the second time series of the same month
@@ -334,36 +381,33 @@ class CutMix(object):
                       same_month_segs2.append(other_seg)
                       break          
       return same_month_segs1, same_month_segs2
-
    
-
-
 
 class TrainTransform(object):
   def __init__(self):
     self.transform = transforms.Compose([
-        Jittering(p= 1.0, sigma = 0.03),
-        Scaling(p = 1.0, sigma = 0.1),
-        WindowSlice(p=0.8,  magnitude= 0.9),
-        WindowWarp(p=0.5,timeframe = "monthly", scale=[0.5, 2.0]),
-        Resample(p= 0.5),
-        CutMix(p=0.5,  alpha=1.0, beta=1.0, timeframe="monthly")
-
+        Jittering(p= 0.9, sigma = 0.03),
+        Scaling(p = 0.9, sigma = 0.1),
+        Window_Interpolation(p=0.5, crop_range=[0.6, 0.9]),
+        Cut_Mixing(p=0.5,  alpha=1.0, beta=1.0, timeframe="monthly"),
+        Window_Warping(p=0.5,timeframe = None, scale=[0.5, 2.0]),
+        Resampling(p= 0.5, num_new_dates=10, constant_ratio = 0.6)
     ])
     self.transform_prime = transforms.Compose([
-        Jittering(p= 0.1, sigma = 0.03),
-        Scaling(p = 1.0, sigma = 1.0),
-        WindowSlice(p=0.2,  magnitude= 0.1),                
-        WindowWarp(p=0.5, timeframe = "monthly", scale=[0.5, 2.0]),
-        Resample(p= 0.5),
-        CutMix(p=0.5, alpha=1.0, beta=1.0, timeframe="monthly")
+        Jittering(p= 0.9, sigma = 0.03),
+        Scaling(p = 0.9, sigma = 0.1),
+        Window_Interpolation(p=0.5, crop_range=[0.6, 0.9]), 
+        Cut_Mixing(p=0.5,  alpha=1.0, beta=1.0, timeframe="monthly"),               
+        Window_Warping(p=0.5, timeframe = None, scale=[0.5, 2.0]),
+        Resampling(p= 0.5, num_new_dates=10, constant_ratio = 0.6),
     ])
 
   def __call__(self,sample):
     
-    x = self.transform(sample)
-    x_prime = self.transform(sample)
+    x, _, xdates = self.transform(sample)
+    x_prime, _, xprime_dates = self.transform(sample)
+    dates = (xdates[0], xprime_dates[0])
 
-    return x, x_prime
+    return x, x_prime, dates
 
 augmentations = TrainTransform()
