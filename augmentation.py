@@ -3,6 +3,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 import datetime
 import torchvision.transforms as transforms
+import random
 
 
 class Jittering(object):
@@ -53,11 +54,11 @@ class Window_Interpolation(object):
 
         if np.random.rand() < self.p:
           # Perform window slicing on the first time series in the tuple
-          ts1_sliced = self._window_interp(ts1, dates1)
+          ts1_win_interp = self._window_interp(ts1, dates1)
         else:
-          ts1_sliced = ts1
+          ts1_win_interp = ts1
 
-        return ts1_sliced , ts2 , dates
+        return ts1_win_interp , ts2 , dates
 
     def day_of_year(self, date_list):
       date_list = [d.strip() for d in date_list]
@@ -70,8 +71,6 @@ class Window_Interpolation(object):
         seq_len = ts.shape[0]
         low, high = self.crop_range
         crop_size = np.random.uniform(low, high)
-        # rand_num = torch.rand(1)
-        # crop_size = low + rand_num * (high - low)
         doy = torch.tensor(self.day_of_year(dates))
 
         win_len = int(round(seq_len * (1 - crop_size)))
@@ -86,9 +85,8 @@ class Window_Interpolation(object):
         f = interp1d(dates_a, ts_a, axis=0, kind='linear', bounds_error=False, fill_value='extrapolate')
         ts_interpolated = torch.from_numpy(f(doy[start:end+1]))
         ts[start:end+1] = ts_interpolated
-
+        
         return ts
-
 
 
 class Window_Warping(object):
@@ -110,11 +108,11 @@ class Window_Warping(object):
     dates1, _ = dates
     # Perform window slicing on both time series in the tuple
     if np.random.rand() < self.p:
-      ts1_sliced = self._warp(ts1, dates1)
+      ts1_win_warped = self._warp(ts1, dates1)
     else:
-      ts1_sliced = ts1
+      ts1_win_warped = ts1
     # Return the tuple of sliced time series
-    return ts1_sliced , ts2 , dates
+    return ts1_win_warped , ts2 , dates
 
   def day_of_year(self, date_list): 
     date_list = [d.strip() for d in date_list]
@@ -179,9 +177,10 @@ class Window_Warping(object):
     return segments
 
 
+
   def _warp(self, ts, dates):
     doy = self.day_of_year(dates)
-    scaling_factor = np.random.choice(self.scale)
+    scaling_factor = random.choice(self.scale)
     
     if self.timeframe == "monthly":
       segments = self.create_months_segment(dates) 
@@ -190,7 +189,7 @@ class Window_Warping(object):
     else:
       raise ValueError("Invalid timeframe provided") 
 
-    segment = np.random.choice(segments)
+    segment = random.choice(segments)
 
     # start and end doy of chosen window segment
     strt_doy = segment[0]  
@@ -207,8 +206,8 @@ class Window_Warping(object):
     strt_idx = indices[0]
     end_idx = indices[1]
     
-    dates_a = doy[:strt_idx] + doy[end_idx+1:]
-
+    dates_a = doy[:strt_idx]+ doy[end_idx+1:]
+    
     first_seg = ts[:strt_idx]  
     last_seg = ts[end_idx+1:] 
 
@@ -219,15 +218,18 @@ class Window_Warping(object):
 
     f = interp1d(dates_a, ts_a, axis = 0, kind="linear", bounds_error=False, fill_value='extrapolate') 
     ts_warped = f(new_points)
+    
 
     # second interpolation to return to original shape
     concat_segs = np.concatenate((first_seg, ts_warped, last_seg))
     newer_points = doy[:strt_idx] + list(new_points)+ doy[end_idx+1:] 
-
+    
     f2 = interp1d(newer_points, concat_segs, axis = 0, kind="linear", bounds_error=False, fill_value='extrapolate')
-    warped = torch.from_numpy(f2(doy))
+    warped = f2(doy)
+    warped = torch.from_numpy(warped)
 
     return warped
+
 
 
 class Resampling(object):
@@ -240,11 +242,11 @@ class Resampling(object):
     ts1, ts2, dates = sits
     date1, date2 = dates
     d_ = None
-    
     if np.random.rand() < self.p:
       resampled1, d_ = self._resample(ts1, date1)
     else:
       resampled1 = ts1 
+      d_ = date1
 
     dates = d_ , date2 
     return resampled1, ts2 , dates
@@ -268,7 +270,7 @@ class Resampling(object):
     doy_s = [d for d in dates]
     return doy_s
 
-  def convert_day_of_year_to_dates(self, day_of_year_list, year=None):
+  def convert_day_of_year_to_dates(self, day_of_year_list, year):
     dates = []
     for day_of_year in day_of_year_list:
       day_of_year = day_of_year
@@ -279,7 +281,8 @@ class Resampling(object):
 
 
   def _resample(self, ts, dates):
-    year = dates[0].split('-')[0]
+    first_date = dates[0]
+    year = first_date.split('-')[0]
     acq_doy = self.day_of_year(dates)
     entire_doy = self.get_days_of_year(year)
     num_dates_to_keep_unchanged = int(round(ts.shape[0] * self.constant_ratio))
@@ -297,11 +300,15 @@ class Resampling(object):
     chosen_dates = np.random.choice(dates_to_choose_from, size=self.num_new_dates, replace=False)
     upsampled_dates = list(chosen_dates) + acq_doy
     upsampled_dates.sort()
+    upsampled_dates = np.nan_to_num(upsampled_dates)
+    
+    ## interpolate 
     f = interp1d(acq_doy, ts, axis = 0, kind="linear", bounds_error=False, fill_value= 'extrapolate')
     upsampled_ts = f(upsampled_dates)
 
     # downsample the new data back to the original shape, keeping some dates from the initial acquisition constant, interpolate other points
     constant_dates = np.random.choice(acq_doy, size = num_dates_to_keep_unchanged, replace = False)
+    
     dates_to_choose_from2 = []
     for d in upsampled_dates:
       if d not in constant_dates:
@@ -309,12 +316,13 @@ class Resampling(object):
     chosen_dates2 = np.random.choice(dates_to_choose_from2, size = len(acq_doy) - num_dates_to_keep_unchanged , replace = False )
     downsampled_dates = list(chosen_dates2)  + list(constant_dates )
     downsampled_dates.sort()
+
+    ## interpolate 
     f2 = interp1d(upsampled_dates, upsampled_ts, axis = 0, kind="linear", bounds_error=False, fill_value= 'extrapolate' )
     downsampled_ts = torch.from_numpy(f2(downsampled_dates))
     downsampled_dates_ = self.convert_day_of_year_to_dates(downsampled_dates, year)
 
     return downsampled_ts, downsampled_dates_
-
 
 class Cut_Mixing(object):
     def __init__(self, p,  alpha=0, beta=0, timeframe=""):
@@ -410,4 +418,4 @@ class TrainTransform(object):
 
     return x, x_prime, dates
 
-augmentations = TrainTransform()
+
