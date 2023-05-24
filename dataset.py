@@ -10,16 +10,17 @@ import torchvision.transforms as transforms
 
 class SITSDataset(tdata.Dataset):
   def __init__(
-      self, folder, norm = True,transform = None,year = ['2018', '2019']):
+      self, folder, norm = True, transform = None,year = ['2018', '2019'], maxsequence=33):
     super(SITSDataset, self).__init__()
     self.folder, self.nbands, self.transform, self.norm = folder, 10, transform, norm
     self.year18, self.year19  = year[0], year[1]
-    self.dataframe18 = pd.read_csv(os.path.join(self.folder, f"df_patches_{self.year18}.csv" ))
-    self.dataframe19 = pd.read_csv(os.path.join(self.folder, f"df_patches_{self.year19}.csv" ))
+    self.dataframe18 = pd.read_csv(os.path.join(self.folder, f"patches_{self.year18}.csv" ))
+    self.dataframe19 = pd.read_csv(os.path.join(self.folder, f"patches_{self.year19}.csv" ))
     self.sits18, self.sits19 = self.dataframe18["Patch_path"], self.dataframe19["Patch_path"]
     self.num_images =  self.sits18 + self.sits19
     self.dates18 = self.date_list(os.path.join(self.folder, f"{self.year18}_dates.txt"))
     self.dates19 = self.date_list(os.path.join(self.folder, f"{self.year19}_dates.txt"))
+    self.maxsequence = maxsequence
   
   def __len__(self):
     return len(self.num_images)
@@ -37,8 +38,24 @@ class SITSDataset(tdata.Dataset):
     nbands = nbands
     new_shape = (nImages // nbands, nbands, sits_ .shape[1], sits_ .shape[2])
     sits_ = sits_.reshape(new_shape)
-    sits_ = torch.from_numpy(sits_.astype('float16'))
+    sits_ = torch.from_numpy(sits_.astype('float32'))
     return sits_ 
+
+  def day_of_year(self, date_list):
+      date_list = [d.strip() for d in date_list]
+      date_list = [datetime.datetime.strptime(d, "%Y-%m-%d").timetuple().tm_yday for d in date_list]
+      doy_s = [d for d in date_list]
+      return doy_s
+
+  def temporal_dropout(self, elem):    
+    x, dates = elem
+    if x.shape[0] <= self.maxsequence:
+      return elem
+    else:
+      idx = np.random.choice(x.shape[0], self.maxsequence, replace=False)
+      idx.sort()
+      return x[idx], [dates[i] for i in idx]
+      #return x[idx], dates[idx]
 
   def __getitem__(self, index):
     sits_18 = self.sits18[index]
@@ -70,7 +87,17 @@ class SITSDataset(tdata.Dataset):
     #  Apply transforms
     if self.transform is not None:
       sits_ = self.transform(sample)
-      
-    return sits_ 
+    
+    # Apply temporal subsampling (to avoid redefining the collate function)
+    sits1, sits2, dates = sits_
+    dates1, dates2 = dates
+    sits1, dates1 = self.temporal_dropout((sits1,dates1))
+    sits2, dates2 = self.temporal_dropout((sits2,dates2))
+
+    doy1 = self.day_of_year(dates1)
+    doy1 =  np.array(doy1)
+    doy2 = self.day_of_year(dates2)
+    doy2 =  np.array(doy2)
+    return sits1, sits2, (doy1, doy2) 
 
     
