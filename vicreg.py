@@ -41,18 +41,17 @@ class VICReg(nn.Module):
         self.backbone1 = UTAE()
         self.backbone2 = UTAE()
 
-        self.projector_s1 = VICProjectorConv(projector_dim)
-        self.projector_s2 = VICProjectorConv(projector_dim)
+        self.projector1 = VICProjectorConv(projector_dim)
+        self.projector2 = VICProjectorConv(projector_dim)
         
 
     def forward(self, sits_1, dates_1, sits_2, dates_2):
         _, maps1 = self.backbone1(sits_1, dates_1)         
         _, maps2 = self.backbone2(sits_2, dates_2)
-        x1 = self.projector_s1(maps1[-1])
-        x2 = self.projector_s2(maps2[-1])
+        x1 = self.projector1(maps1[-1])
+        x2 = self.projector2(maps2[-1])
 
-        loss, losses = VICLoss(x1, x2)
-        return loss , losses
+        return x1 , x2
 
 
 class VICLoss(nn.Module):
@@ -70,6 +69,7 @@ class VICLoss(nn.Module):
 
         # invariance loss
         repr_loss = F.mse_loss(x, y)
+        print("repr_loss: ", repr_loss)
         
         x = x - x.mean(dim=0)
         y = y - y.mean(dim=0)
@@ -82,6 +82,7 @@ class VICLoss(nn.Module):
             std_y = torch.sqrt(y.var(dim=0, correction=0) + 0.0001)
         # variance 
         std_loss = torch.mean(F.relu(1 - std_x)) / 2 + torch.mean(F.relu(1 - std_y)) / 2
+        print("std_loss: ", std_loss)
 
         if batch_size>1:
             cov_x = (x.T @ x) / (batch_size - 1)
@@ -94,12 +95,15 @@ class VICLoss(nn.Module):
         cov_loss = self._off_diagonal(cov_x).pow_(2).sum().div(
             num_features
         ) + self._off_diagonal(cov_y).pow_(2).sum().div(num_features)
+        print("cov_loss: ",cov_loss)
 
         loss = (
             self.sim_coeff * repr_loss
             + self.std_coeff * std_loss
             + self.cov_coeff * cov_loss
         )
+        print("loss: ", loss)
+
         return loss, (repr_loss, std_loss, cov_loss)
 
     def _off_diagonal(self,x):

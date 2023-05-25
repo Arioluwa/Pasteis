@@ -9,7 +9,7 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from dataset import SITSDataset
-from vicreg import VICReg
+from vicreg import VICReg, VICLoss
 import augmentation as aug
 from optimization import optim , adjust_learning_rate
 from tqdm import tqdm
@@ -24,12 +24,12 @@ def get_arguments():
     parser.add_argument("--data-dir",  help='Path to dataset')
 
     # Checkpoints
-    parser.add_argument("--log-freq-time", type=int, default=1000, help='Print logs to the stats.txt file every [log-freq-time] seconds')
+    parser.add_argument("--save-freq", type=int, default=1000, help='Print logs to the stats.txt file every [save-freq-] seconds')
     parser.add_argument('--log_dir', default= r'logs', help = 'directory to save logs')
     parser.add_argument('--save_chpt', default = 'checkpoints', help = 'path to save checkpoints')
 
     # Model
-    parser.add_argument("--projector-dim", default=[32, 64, 128, 256], help='Dimension of Projector / Expander')
+    #parser.add_argument("--projector-dim", default=[32, 64, 128, 256], help='Dimension of Projector / Expander')
 
     # Optim
     parser.add_argument("--epochs", type=int, default=1,help='Number of epochs')
@@ -81,7 +81,9 @@ def main(args):
             d1, d2 = dates
             d1 = d1.to(args.device)
             d2 = d2.to(args.device)
-            loss, all_losses = model(view_a, d1, view_b, d2)
+            repr1, repr2 = model(view_a, d1, view_b, d2)
+            
+            loss, all_losses = VICLoss()(repr1, repr2)
             repr_loss, std_loss, cov_loss = all_losses
             loss.backward()
             optimizer.step()
@@ -92,15 +94,15 @@ def main(args):
 
             if step % int(args.save_freq) == 0 and step:
                 with open(os.path.join(args.log_dir, 'logs.txt'), 'a') as log_file:
-                    log_file.write(f'Epoch: {epoch}, Step: {step}, Train loss: {loss.cpu().detach().numpy()}, Sim loss: {_sim_loss.cpu().detach().numpy()}, Std loss: {_std_loss.cpu().detach().numpy()}, Cov loss: {_cov_loss.cpu().detach().numpy()}\n')
+                    log_file.write(f'Epoch: {epochs}, Step: {step}, Train loss: {loss.cpu().detach().numpy()}, Sim loss: {repr_loss.cpu().detach().numpy()}, Std loss: {std_loss.cpu().detach().numpy()}, Cov loss: {cov_loss.cpu().detach().numpy()}\n')
 
 
-            loop.set_description(f'Epoch [{epoch}/{args.epoch}]')
+            loop.set_description(f'Epoch [{epoch}/{args.epochs}]')
             loop.set_postfix(loss = loss.cpu().detach().numpy())
 
         print(f'Loss for epoch {epoch} is {loss.cpu().detach().numpy()}')
     print('End of the Training. Saving final checkpoints.')
-    state = dict(epoch=args.epoch, model=model.state_dict(), optimizer=optimizer.state_dict())
+    state = dict(epoch=args.epochs, model=model.state_dict(), optimizer=optimizer.state_dict())
     torch.save(state, os.path.join('.', args.save_chpt,  'final_checkpoint.pth'))
     writer.flush()
     writer.close()
